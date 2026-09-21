@@ -213,6 +213,19 @@ app.post('/api/vehicles', auth, asyncRoute(async (req, res) => {
   const { make, model, registration_number, color, vehicle_type, parking_bay_id } = req.body;
   if (!registration_number) return res.status(400).json({ error: 'registration_number is required' });
 
+  if (parking_bay_id) {
+    const bay = await q('SELECT id FROM parking_bays WHERE id=$1 LIMIT 1', [parking_bay_id]);
+    if (!bay.rows.length) return res.status(400).json({ error: 'Parking bay not found', parking_bay_id });
+  }
+
+  const existing = await q(
+    'SELECT * FROM vehicles WHERE customer_id=$1 AND registration_number=$2 LIMIT 1',
+    [req.user.sub, registration_number]
+  );
+  if (existing.rows.length) {
+    return res.status(409).json({ error: 'Vehicle with this registration number already exists', vehicle: existing.rows[0] });
+  }
+
   const r = await q(`
     INSERT INTO vehicles(customer_id,parking_bay_id,registration_number,make,model,color,vehicle_type)
     VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *
