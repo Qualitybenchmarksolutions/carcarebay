@@ -11,472 +11,116 @@ import multer from 'multer';
 
 const app = express();
 const PORT = process.env.PORT || 4000;
-
-if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required');
-if (!process.env.JWT_SECRET) throw new Error('JWT_SECRET is required');
-
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL.includes('supabase') ? { rejectUnauthorized: false } : undefined
-});
-
-const origins = (process.env.CORS_ORIGINS || '*').split(',').map(x => x.trim());
-app.use(cors({ origin: (origin, cb) => cb(null, !origin || origins.includes('*') || origins.includes(origin)) }));
-app.use(express.json({ limit: '2mb' }));
+const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: process.env.DATABASE_URL?.includes('supabase.co') ? { rejectUnauthorized: false } : undefined });
+const origins = (process.env.CORS_ORIGINS || '*').split(',').map(s => s.trim());
+app.use(cors({ origin: (o, cb) => cb(null, !o || origins.includes('*') || origins.includes(o)) }));
+app.use(express.json({ limit: '5mb' }));
 
 const uploadDir = path.resolve(process.env.STORAGE_DIR || './uploads');
 fs.mkdirSync(uploadDir, { recursive: true });
 const upload = multer({ dest: uploadDir });
-
 const razorpay = process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET
-  ? new Razorpay({ key_id: process.env.RAZORPAY_KEY_ID, key_secret: process.env.RAZORPAY_KEY_SECRET })
-  : null;
+  ? new Razorpay({ key_id: process.env.RAZORPAY_KEY_ID, key_secret: process.env.RAZORPAY_KEY_SECRET }) : null;
 
 const q = (text, params = []) => pool.query(text, params);
-const sign = u => jwt.sign(
-  { sub: u.id, role: u.role, name: u.name },
-  process.env.JWT_SECRET,
-  { expiresIn: '7d' }
-);
-
+const sign = u => jwt.sign({ sub: u.id, role: u.role, name: u.full_name }, process.env.JWT_SECRET, { expiresIn: '7d' });
 function auth(req, res, next) {
   try {
     const h = req.headers.authorization || '';
-    req.user = jwt.verify(h.replace(/^Bearer\s+/i, ''), process.env.JWT_SECRET);
+    if (!h.startsWith('Bearer ')) throw new Error('Missing token');
+    req.user = jwt.verify(h.slice(7), process.env.JWT_SECRET);
     next();
-  } catch {
-    res.status(401).json({ error: 'Unauthorized' });
-  }
+  } catch { res.status(401).json({ error: 'Unauthorized' }); }
 }
+const roles = (...rs) => (req, res, next) => rs.includes(req.user.role) ? next() : res.status(403).json({ error: 'Forbidden' });
+const bad = (res, msg) => res.status(400).json({ error: msg });
 
-const roles = (...rs) => (req, res, next) =>
-  rs.includes(req.user.role) ? next() : res.status(403).json({ error: 'Forbidden' });
-
-function normalizeStatus(value) {
-  const s = String(value || '').toLowerCase().replace(/\s+/g, '_');
-  return s === 'complete' ? 'completed' : s;
-}
-
-function toScheduledDateTime(date, time) {
-  if (!date) return null;
-  return time ? `${date}T${time}` : `${date}T09:00:00`;
-}
-
-// The original MVP schema used a different users table.  The current Supabase
-// schema deliberately keeps customers and partners separate, so credentials
-// live in this small compatibility table instead of changing the business tables.
 async function ensureAuthTable() {
-  await q(`
-    CREATE TABLE IF NOT EXISTS auth_credentials (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      phone TEXT UNIQUE NOT NULL,
-      password_hash TEXT NOT NULL,
-      role TEXT NOT NULL CHECK (role IN ('customer','partner','admin')),
-      profile_id UUID,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    )
-  `);
-  await q(`CREATE INDEX IF NOT EXISTS idx_auth_credentials_profile ON auth_credentials(profile_id)`);
+  await q(`CREATE TABLE IF NOT EXISTS auth_credentials (
+    customer_id uuid PRIMARY KEY REFERENCES customers(id) ON DELETE CASCADE,
+    password_hash text NOT NULL,
+    created_at timestamptz DEFAULT now()
+  )`);
 }
 
 app.get('/health', async (_, res) => {
-  try {
-    await q('SELECT 1');
-    res.json({ ok: true, service: 'CarCareBay API', database: 'postgresql' });
-  } catch {
-    res.status(503).json({ ok: false, error: 'Database unavailable' });
-  }
+  try { await q('SELECT 1'); await ensureAuthTable(); res.json({ ok: true, service: 'CarCareBay API', database: 'postgresql' }); }
+  catch (e) { console.error(e); res.status(503).json({ ok: false, error: 'Database unavailable' }); }
+});
+
+app.get('/api/plans', async (_, res) => {
+  try { const { rows } = await q(`SELECT id,name,description,monthly_price,monthly_price*100 AS price_paise,COALESCE(wash_credits,0) AS included_exterior,COALESCE(interior_credits,0) AS included_interior,active FROM service_plans WHERE active=true ORDER BY monthly_price`); res.json(rows); }
+  catch (e) { console.error(e); res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/auth/register', async (req, res) => {
-  const { phone, name, password, email = null, apartment_id = null, role = 'customer' } = req.body;
-  if (!phone || !name || !password) return res.status(400).json({ error: 'phone, name and password required' });
-  if (!['customer', 'partner'].includes(role)) return res.status(400).json({ error: 'Invalid registration role' });
-
-  const client = await pool.connect();
+  const { name, full_name, phone, email, password, apartment_id } = req.body;
+  const customerName = full_name || name;
+  if (!customerName || !phone || !password) return bad(res, 'Name, phone and password required');
   try {
-    await client.query('BEGIN');
+    await ensureAuthTable();
+    const exists = await q('SELECT id FROM customers WHERE phone=$1 LIMIT 1', [phone]);
+    if (exists.rowCount) return res.status(409).json({ error: 'Phone already registered' });
     const hash = await bcrypt.hash(password, 10);
-    let profile;
-
-    if (role === 'customer') {
-      const r = await client.query(
-        `INSERT INTO customers(full_name, phone, email, apartment_id, role, status)
-         VALUES($1,$2,$3,$4,'customer','active')
-         RETURNING id, full_name AS name, phone, email, apartment_id, role, status`,
-        [name, phone, email, apartment_id]
-      );
-      profile = r.rows[0];
-    } else {
-      const r = await client.query(
-        `INSERT INTO partners(full_name, phone, email, status, rating, jobs_completed)
-         VALUES($1,$2,$3,'active',0,0)
-         RETURNING id, full_name AS name, phone, email, status, rating, jobs_completed`,
-        [name, phone, email]
-      );
-      profile = r.rows[0];
-    }
-
-    await client.query(
-      `INSERT INTO auth_credentials(phone, password_hash, role, profile_id) VALUES($1,$2,$3,$4)`,
-      [phone, hash, role, profile.id]
-    );
-    await client.query('COMMIT');
-
-    res.status(201).json({ user: profile, token: sign({ id: profile.id, role, name }) });
-  } catch (e) {
-    await client.query('ROLLBACK');
-    if (e.code === '23505') return res.status(409).json({ error: 'Phone already registered' });
-    console.error(e);
-    res.status(500).json({ error: 'Registration failed' });
-  } finally {
-    client.release();
-  }
+    const c = await q(`INSERT INTO customers(full_name,phone,email,apartment_id,role,status) VALUES($1,$2,$3,$4,'customer','active') RETURNING *`, [customerName, phone, email || null, apartment_id || null]);
+    await q('INSERT INTO auth_credentials(customer_id,password_hash) VALUES($1,$2)', [c.rows[0].id, hash]);
+    const user = c.rows[0]; res.status(201).json({ token: sign(user), user });
+  } catch (e) { console.error(e); res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/auth/login', async (req, res) => {
   const { phone, password } = req.body;
-  if (!phone || !password) return res.status(400).json({ error: 'phone and password required' });
+  if (!phone || !password) return bad(res, 'Phone number and password required');
   try {
-    const { rows } = await q(`SELECT * FROM auth_credentials WHERE phone=$1`, [phone]);
-    const cred = rows[0];
-    if (!cred || !await bcrypt.compare(password, cred.password_hash)) {
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
-
-    let user;
-    if (cred.role === 'customer') {
-      const r = await q(`SELECT id, full_name AS name, phone, email, apartment_id, role, status FROM customers WHERE id=$1`, [cred.profile_id]);
-      user = r.rows[0];
-    } else if (cred.role === 'partner') {
-      const r = await q(`SELECT id, full_name AS name, phone, email, status FROM partners WHERE id=$1`, [cred.profile_id]);
-      user = r.rows[0];
-    } else {
-      user = { id: cred.profile_id || cred.id, name: 'Admin', phone, role: 'admin', status: 'active' };
-    }
-
-    if (!user) return res.status(401).json({ error: 'Account not found' });
-    res.json({ user, token: sign({ id: user.id, role: cred.role, name: user.name }) });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: 'Login failed' });
-  }
+    await ensureAuthTable();
+    const r = await q(`SELECT c.*,a.password_hash FROM customers c JOIN auth_credentials a ON a.customer_id=c.id WHERE c.phone=$1 LIMIT 1`, [phone]);
+    if (!r.rowCount || !(await bcrypt.compare(password, r.rows[0].password_hash))) return res.status(401).json({ error: 'Invalid phone or password' });
+    const user = r.rows[0]; delete user.password_hash; res.json({ token: sign(user), user });
+  } catch (e) { console.error(e); res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/me', auth, async (req, res) => {
-  if (req.user.role === 'customer') {
-    const { rows } = await q(`SELECT id, full_name AS name, phone, email, apartment_id, role, status FROM customers WHERE id=$1`, [req.user.sub]);
-    return res.json(rows[0] || null);
-  }
-  if (req.user.role === 'partner') {
-    const { rows } = await q(`SELECT id, full_name AS name, phone, email, status, rating, jobs_completed FROM partners WHERE id=$1`, [req.user.sub]);
-    return res.json(rows[0] || null);
-  }
-  res.json({ id: req.user.sub, name: req.user.name, role: 'admin' });
+  try { const { rows } = await q('SELECT * FROM customers WHERE id=$1', [req.user.sub]); if (!rows[0]) return res.status(404).json({ error: 'Customer not found' }); res.json(rows[0]); }
+  catch(e){res.status(500).json({error:e.message});}
 });
 
-app.get('/api/plans', async (_, res) => {
-  const { rows } = await q(`
-    SELECT id, name, description, monthly_price,
-           ROUND(monthly_price * 100)::int AS price_paise,
-           wash_credits AS included_exterior,
-           interior_credits AS included_interior,
-           active
-    FROM service_plans WHERE active=true ORDER BY monthly_price
-  `);
-  res.json(rows);
+app.get('/api/vehicles', auth, async (req,res)=>{ try { const {rows}=await q('SELECT * FROM vehicles WHERE customer_id=$1 ORDER BY created_at DESC',[req.user.sub]); res.json(rows); } catch(e){res.status(500).json({error:e.message});} });
+app.post('/api/vehicles', auth, async (req,res)=>{
+  const { make, model, registration_number, color, vehicle_type, parking_bay_id } = req.body;
+  if (!registration_number || !make || !model) return bad(res,'Make, model and registration number required');
+  try { const {rows}=await q(`INSERT INTO vehicles(customer_id,parking_bay_id,registration_number,make,model,color,vehicle_type) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *`,[req.user.sub,parking_bay_id||null,registration_number,make,model,color||null,vehicle_type||'car']); res.status(201).json(rows[0]); }
+  catch(e){res.status(500).json({error:e.message});}
 });
+app.patch('/api/vehicles/:id', auth, async (req,res)=>{ try { const fields=['registration_number','make','model','color','vehicle_type','parking_bay_id']; const vals=[]; const sets=[]; for(const f of fields){if(req.body[f]!==undefined){vals.push(req.body[f]);sets.push(`${f}=$${vals.length}`)}} if(!sets.length)return bad(res,'No fields to update'); vals.push(req.params.id,req.user.sub); const {rows}=await q(`UPDATE vehicles SET ${sets.join(',')} WHERE id=$${vals.length-1} AND customer_id=$${vals.length} RETURNING *`,vals); if(!rows[0])return res.status(404).json({error:'Vehicle not found'});res.json(rows[0]); }catch(e){res.status(500).json({error:e.message});} });
+app.delete('/api/vehicles/:id', auth, async (req,res)=>{try{const r=await q('DELETE FROM vehicles WHERE id=$1 AND customer_id=$2 RETURNING id',[req.params.id,req.user.sub]);if(!r.rowCount)return res.status(404).json({error:'Vehicle not found'});res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
 
-app.post('/api/vehicles', auth, roles('customer','admin'), async (req, res) => {
-  const customerId = req.user.role === 'admin' ? req.body.customer_id : req.user.sub;
-  const { registration_number, make, model, color = null, vehicle_type = 'car', parking_bay_id = null } = req.body;
-  if (!registration_number || !make || !model) {
-    return res.status(400).json({ error: 'registration_number, make and model are required' });
-  }
-  try {
-    const { rows } = await q(`
-      INSERT INTO vehicles(customer_id, parking_bay_id, registration_number, make, model, color, vehicle_type)
-      VALUES($1,$2,$3,$4,$5,$6,$7)
-      RETURNING *
-    `, [customerId, parking_bay_id, registration_number, make, model, color, vehicle_type]);
-    res.status(201).json(rows[0]);
-  } catch (e) {
-    if (e.code === '23505') return res.status(409).json({ error: 'Vehicle registration number already exists' });
-    console.error(e);
-    res.status(500).json({ error: 'Vehicle creation failed' });
-  }
-});
+app.get('/api/apartments', async (_,res)=>{try{const {rows}=await q(`SELECT a.*,COUNT(DISTINCT p.id)::int AS parking_bays FROM apartments a LEFT JOIN parking_bays p ON p.apartment_id=a.id GROUP BY a.id ORDER BY a.name`);res.json(rows);}catch(e){res.status(500).json({error:e.message});}});
+app.post('/api/apartments', auth, roles('admin'), async(req,res)=>{const {name,address,city,pincode,total_cars,status}=req.body;if(!name)return bad(res,'Name required');try{const {rows}=await q(`INSERT INTO apartments(name,address,city,pincode,total_cars,status) VALUES($1,$2,$3,$4,$5,$6) RETURNING *`,[name,address||null,city||'Bengaluru',pincode||null,total_cars||0,status||'active']);res.status(201).json(rows[0]);}catch(e){res.status(500).json({error:e.message});}});
 
-app.get('/api/vehicles', auth, async (req, res) => {
-  const customerId = req.user.role === 'admin' ? req.query.customer_id : req.user.sub;
-  if (!customerId) return res.status(400).json({ error: 'customer_id required for admin' });
-  const { rows } = await q(`
-    SELECT v.*, pb.tower, pb.floor, pb.bay_number AS bay_number, a.name AS apartment
-    FROM vehicles v
-    LEFT JOIN parking_bays pb ON pb.id=v.parking_bay_id
-    LEFT JOIN apartments a ON a.id=pb.apartment_id
-    WHERE v.customer_id=$1
-    ORDER BY v.created_at DESC
-  `, [customerId]);
-  res.json(rows);
-});
+app.get('/api/apartments/:id/parking-bays', async(req,res)=>{try{const {rows}=await q('SELECT * FROM parking_bays WHERE apartment_id=$1 ORDER BY tower,floor,bay_number',[req.params.id]);res.json(rows);}catch(e){res.status(500).json({error:e.message});}});
+app.post('/api/parking-bays', auth, roles('admin'), async(req,res)=>{const {apartment_id,tower,floor,bay_number,status}=req.body;if(!apartment_id||!bay_number)return bad(res,'Apartment and bay number required');try{const {rows}=await q(`INSERT INTO parking_bays(apartment_id,tower,floor,bay_number,status) VALUES($1,$2,$3,$4,$5) RETURNING *`,[apartment_id,tower||null,floor||null,bay_number,status||'available']);res.status(201).json(rows[0]);}catch(e){res.status(500).json({error:e.message});}});
 
-app.patch('/api/vehicles/:id', auth, roles('customer','admin'), async (req, res) => {
-  const current = await q(`SELECT * FROM vehicles WHERE id=$1`, [req.params.id]);
-  if (!current.rows[0]) return res.status(404).json({ error: 'Vehicle not found' });
-  if (req.user.role === 'customer' && current.rows[0].customer_id !== req.user.sub) {
-    return res.status(403).json({ error: 'Forbidden' });
-  }
+app.get('/api/subscriptions', auth, async(req,res)=>{try{const {rows}=await q(`SELECT s.*,p.name AS plan_name,p.monthly_price,p.wash_credits,p.interior_credits,v.registration_number,v.make,v.model FROM subscriptions s JOIN service_plans p ON p.id=s.plan_id JOIN vehicles v ON v.id=s.vehicle_id WHERE s.customer_id=$1 ORDER BY s.created_at DESC`,[req.user.sub]);res.json(rows);}catch(e){res.status(500).json({error:e.message});}});
+app.post('/api/subscriptions', auth, async(req,res)=>{const {vehicle_id,plan_id,start_date,end_date}=req.body;if(!vehicle_id||!plan_id)return bad(res,'Vehicle and plan required');try{const v=await q('SELECT id FROM vehicles WHERE id=$1 AND customer_id=$2',[vehicle_id,req.user.sub]);if(!v.rowCount)return res.status(404).json({error:'Vehicle not found'});const p=await q('SELECT id FROM service_plans WHERE id=$1 AND active=true',[plan_id]);if(!p.rowCount)return res.status(404).json({error:'Plan not found'});const {rows}=await q(`INSERT INTO subscriptions(customer_id,vehicle_id,plan_id,status,start_date,end_date) VALUES($1,$2,$3,'active',$4,$5) RETURNING *`,[req.user.sub,vehicle_id,plan_id,start_date||new Date().toISOString().slice(0,10),end_date||null]);res.status(201).json(rows[0]);}catch(e){res.status(500).json({error:e.message});}});
 
-  const allowed = ['registration_number','make','model','color','vehicle_type','parking_bay_id'];
-  const sets = [];
-  const vals = [];
-  for (const key of allowed) {
-    if (req.body[key] !== undefined) {
-      vals.push(req.body[key]);
-      sets.push(`${key}=$${vals.length}`);
-    }
-  }
-  if (!sets.length) return res.status(400).json({ error: 'No editable fields' });
-  vals.push(req.params.id);
-  try {
-    const { rows } = await q(`UPDATE vehicles SET ${sets.join(', ')} WHERE id=$${vals.length} RETURNING *`, vals);
-    res.json(rows[0]);
-  } catch (e) {
-    if (e.code === '23505') return res.status(409).json({ error: 'Vehicle registration number already exists' });
-    console.error(e);
-    res.status(500).json({ error: 'Vehicle update failed' });
-  }
-});
+app.get('/api/bookings', auth, async(req,res)=>{try{const {rows}=await q(`SELECT b.*,v.registration_number,v.make,v.model,a.name AS apartment_name,pb.tower,pb.floor,pb.bay_number,pt.full_name AS partner_name FROM bookings b LEFT JOIN vehicles v ON v.id=b.vehicle_id LEFT JOIN apartments a ON a.id=b.apartment_id LEFT JOIN parking_bays pb ON pb.id=b.parking_bay_id LEFT JOIN partners pt ON pt.id=b.partner_id WHERE b.customer_id=$1 ORDER BY b.created_at DESC`,[req.user.sub]);res.json(rows);}catch(e){res.status(500).json({error:e.message});}});
+app.post('/api/bookings', auth, async(req,res)=>{const {vehicle_id,apartment_id,parking_bay_id,service_type,scheduled_date,scheduled_time,customer_notes}=req.body;if(!vehicle_id||!service_type||!scheduled_date||!scheduled_time)return bad(res,'Vehicle, service type, date and time required');try{const v=await q('SELECT id,parking_bay_id FROM vehicles WHERE id=$1 AND customer_id=$2',[vehicle_id,req.user.sub]);if(!v.rowCount)return res.status(404).json({error:'Vehicle not found'});const bay=parking_bay_id||v.rows[0].parking_bay_id;let apt=apartment_id||null;if(!apt&&bay){const ar=await q('SELECT apartment_id FROM parking_bays WHERE id=$1',[bay]);apt=ar.rows[0]?.apartment_id||null;}const {rows}=await q(`INSERT INTO bookings(customer_id,vehicle_id,apartment_id,parking_bay_id,service_type,scheduled_date,scheduled_time,status,customer_notes) VALUES($1,$2,$3,$4,$5,$6,$7,'scheduled',$8) RETURNING *`,[req.user.sub,vehicle_id,apt,bay,service_type,scheduled_date,scheduled_time,customer_notes||null]);res.status(201).json(rows[0]);}catch(e){res.status(500).json({error:e.message});}});
+app.patch('/api/bookings/:id', auth, async(req,res)=>{try{const allowed=['status','customer_notes','scheduled_date','scheduled_time'];const vals=[];const sets=[];for(const f of allowed){if(req.body[f]!==undefined){vals.push(req.body[f]);sets.push(`${f}=$${vals.length}`)}}if(!sets.length)return bad(res,'No fields to update');vals.push(req.params.id,req.user.sub);const {rows}=await q(`UPDATE bookings SET ${sets.join(',')} WHERE id=$${vals.length-1} AND customer_id=$${vals.length} RETURNING *`,vals);if(!rows[0])return res.status(404).json({error:'Booking not found'});res.json(rows[0]);}catch(e){res.status(500).json({error:e.message});}});
 
-app.delete('/api/vehicles/:id', auth, roles('customer','admin'), async (req, res) => {
-  const current = await q(`SELECT * FROM vehicles WHERE id=$1`, [req.params.id]);
-  if (!current.rows[0]) return res.status(404).json({ error: 'Vehicle not found' });
-  if (req.user.role === 'customer' && current.rows[0].customer_id !== req.user.sub) {
-    return res.status(403).json({ error: 'Forbidden' });
-  }
-  try {
-    await q(`DELETE FROM vehicles WHERE id=$1`, [req.params.id]);
-    res.json({ ok: true });
-  } catch (e) {
-    if (e.code === '23503') return res.status(409).json({ error: 'Vehicle cannot be deleted because it is used by an existing booking or subscription' });
-    console.error(e);
-    res.status(500).json({ error: 'Vehicle deletion failed' });
-  }
-});
+app.get('/api/partner/jobs', auth, roles('partner','admin'), async(req,res)=>{try{const where=req.user.role==='admin'?'':' AND b.partner_id=$1';const params=req.user.role==='admin'?[]:[req.user.sub];const {rows}=await q(`SELECT b.*,c.full_name AS customer_name,c.phone AS customer_phone,v.registration_number,v.make,v.model,a.name AS apartment_name,pb.tower,pb.floor,pb.bay_number FROM bookings b JOIN customers c ON c.id=b.customer_id JOIN vehicles v ON v.id=b.vehicle_id LEFT JOIN apartments a ON a.id=b.apartment_id LEFT JOIN parking_bays pb ON pb.id=b.parking_bay_id WHERE 1=1${where} ORDER BY b.scheduled_date,b.scheduled_time`,params);res.json(rows);}catch(e){res.status(500).json({error:e.message});}});
+app.patch('/api/partner/jobs/:id', auth, roles('partner','admin'), async(req,res)=>{const {status,partner_notes,before_photo_url,after_photo_url}=req.body;try{const {rows}=await q(`UPDATE bookings SET status=COALESCE($1,status),partner_notes=COALESCE($2,partner_notes),before_photo_url=COALESCE($3,before_photo_url),after_photo_url=COALESCE($4,after_photo_url),started_at=CASE WHEN $1='in_progress' AND started_at IS NULL THEN now() ELSE started_at END,completed_at=CASE WHEN $1='completed' THEN now() ELSE completed_at END,partner_id=CASE WHEN $5='admin' THEN partner_id ELSE $6 END WHERE id=$7 ${req.user.role==='admin'?'':'AND partner_id=$6'} RETURNING *`,[status||null,partner_notes||null,before_photo_url||null,after_photo_url||null,req.user.role,req.user.sub,req.params.id]);if(!rows[0])return res.status(404).json({error:'Job not found'});res.json(rows[0]);}catch(e){res.status(500).json({error:e.message});}});
 
-app.get('/api/customers', auth, roles('admin'), async (_, res) => {
-  const { rows } = await q(`
-    SELECT c.id, c.full_name AS name, c.phone, c.email,
-           COUNT(DISTINCT v.id)::int AS vehicles,
-           COALESCE(MAX(s.status), 'none') AS subscription_status
-    FROM customers c
-    LEFT JOIN vehicles v ON v.customer_id=c.id
-    LEFT JOIN subscriptions s ON s.customer_id=c.id
-    GROUP BY c.id ORDER BY c.created_at DESC
-  `);
-  res.json(rows);
-});
+app.post('/api/ratings', auth, async(req,res)=>{const {booking_id,rating,comment}=req.body;if(!booking_id||!rating)return bad(res,'Booking and rating required');if(Number(rating)<1||Number(rating)>5)return bad(res,'Rating must be 1 to 5');try{const b=await q('SELECT partner_id FROM bookings WHERE id=$1 AND customer_id=$2',[booking_id,req.user.sub]);if(!b.rowCount)return res.status(404).json({error:'Booking not found'});const {rows}=await q(`INSERT INTO ratings(booking_id,customer_id,partner_id,rating,comment) VALUES($1,$2,$3,$4,$5) RETURNING *`,[booking_id,req.user.sub,b.rows[0].partner_id||null,rating,comment||null]);res.status(201).json(rows[0]);}catch(e){res.status(500).json({error:e.message});}});
 
-app.get('/api/apartments', auth, roles('admin'), async (_, res) => {
-  const { rows } = await q(`
-    SELECT a.*, COUNT(DISTINCT v.id)::int AS cars,
-           COUNT(DISTINCT s.customer_id)::int AS subscribers,
-           COALESCE(SUM(sp.monthly_price) FILTER (WHERE s.status='active'),0) AS mrr
-    FROM apartments a
-    LEFT JOIN vehicles v ON v.customer_id IN (SELECT id FROM customers WHERE apartment_id=a.id)
-    LEFT JOIN subscriptions s ON s.customer_id=v.customer_id
-    LEFT JOIN service_plans sp ON sp.id=s.plan_id
-    GROUP BY a.id ORDER BY a.name
-  `);
-  res.json(rows);
-});
+app.get('/api/dashboard', auth, roles('admin'), async(_,res)=>{try{const [c,s,b,r,p,a]=await Promise.all([q("SELECT COUNT(*)::int AS count FROM customers WHERE role='customer'"),q("SELECT COUNT(*)::int AS count FROM subscriptions WHERE status='active'"),q('SELECT COUNT(*)::int AS count FROM bookings'),q('SELECT COALESCE(AVG(rating),0)::numeric(10,2) AS average FROM ratings'),q("SELECT COALESCE(SUM(monthly_price),0)::numeric(12,2) AS monthly_plan_value FROM service_plans WHERE active=true"),q('SELECT COUNT(*)::int AS count FROM apartments')]);res.json({customers:c.rows[0].count,active_subscriptions:s.rows[0].count,bookings:b.rows[0].count,average_rating:r.rows[0].average,active_plan_value:p.rows[0].monthly_plan_value,apartments:a.rows[0].count});}catch(e){res.status(500).json({error:e.message});}});
 
-app.get('/api/partners', auth, roles('admin'), async (_, res) => {
-  const { rows } = await q(`
-    SELECT p.id, p.full_name AS name, p.phone, p.email, p.employee_code,
-           p.rating, p.jobs_completed,
-           COUNT(b.id) FILTER (WHERE b.scheduled_date=CURRENT_DATE)::int AS jobs_today,
-           COUNT(b.id) FILTER (WHERE b.scheduled_date=CURRENT_DATE AND b.status='completed')::int AS completed_today,
-           COUNT(b.id) FILTER (WHERE b.scheduled_date=CURRENT_DATE AND b.status IN ('assigned','in_progress'))::int AS active_jobs
-    FROM partners p LEFT JOIN bookings b ON b.partner_id=p.id
-    GROUP BY p.id ORDER BY p.full_name
-  `);
-  res.json(rows);
-});
+app.post('/api/uploads', auth, upload.single('file'), async(req,res)=>{if(!req.file)return bad(res,'File required');res.status(201).json({filename:req.file.filename,original_name:req.file.originalname,path:req.file.path});});
 
-app.get('/api/bookings', auth, async (req, res) => {
-  let sql = `
-    SELECT b.id, b.service_type AS service,
-           (b.scheduled_date::text || ' ' || b.scheduled_time::text) AS scheduled_at,
-           b.scheduled_date, b.scheduled_time, b.status,
-           b.before_photo_url, b.after_photo_url,
-           c.full_name AS customer, c.phone,
-           (v.make || ' ' || v.model) AS car, v.registration_number AS plate,
-           a.name AS apartment, pb.tower, pb.floor, pb.bay_number AS bay,
-           p.full_name AS partner
-    FROM bookings b
-    JOIN customers c ON c.id=b.customer_id
-    JOIN vehicles v ON v.id=b.vehicle_id
-    JOIN apartments a ON a.id=b.apartment_id
-    LEFT JOIN parking_bays pb ON pb.id=b.parking_bay_id
-    LEFT JOIN partners p ON p.id=b.partner_id`;
-  const args = [];
-  if (req.user.role === 'customer') { sql += ' WHERE b.customer_id=$1'; args.push(req.user.sub); }
-  else if (req.user.role === 'partner') { sql += ' WHERE b.partner_id=$1'; args.push(req.user.sub); }
-  sql += ' ORDER BY b.scheduled_date DESC, b.scheduled_time DESC';
-  const { rows } = await q(sql, args);
-  res.json(rows);
-});
+app.get('/api/notifications', auth, async(req,res)=>{try{const {rows}=await q(`SELECT * FROM notifications WHERE customer_id=$1 OR partner_id=$1 ORDER BY created_at DESC LIMIT 100`,[req.user.sub]);res.json(rows);}catch(e){res.status(500).json({error:e.message});}});
+app.patch('/api/notifications/:id/read', auth, async(req,res)=>{try{const {rows}=await q(`UPDATE notifications SET read_at=now() WHERE id=$1 AND (customer_id=$2 OR partner_id=$2) RETURNING *`,[req.params.id,req.user.sub]);if(!rows[0])return res.status(404).json({error:'Notification not found'});res.json(rows[0]);}catch(e){res.status(500).json({error:e.message});}});
 
-app.post('/api/bookings', auth, roles('customer','admin'), async (req, res) => {
-  const vehicleId = req.body.vehicle_id;
-  const service = req.body.service || req.body.service_type;
-  const apartmentId = req.body.apartment_id;
-  const bayId = req.body.bay_id || req.body.parking_bay_id || null;
-  const scheduledAt = req.body.scheduled_at;
-  const scheduledDate = req.body.scheduled_date || (scheduledAt ? String(scheduledAt).slice(0,10) : null);
-  const scheduledTime = req.body.scheduled_time || (scheduledAt ? String(scheduledAt).slice(11,19) : null);
-  const customerId = req.user.role === 'admin' ? req.body.customer_id : req.user.sub;
+app.get('/api/payments', auth, async(req,res)=>{try{const {rows}=await q('SELECT * FROM payments WHERE customer_id=$1 ORDER BY created_at DESC',[req.user.sub]);res.json(rows);}catch(e){res.status(500).json({error:e.message});}});
+app.post('/api/payments/order', auth, async(req,res)=>{const {subscription_id,booking_id,amount}=req.body;if(!amount)return bad(res,'Amount required');try{let order=null;if(razorpay){order=await razorpay.orders.create({amount:Math.round(Number(amount)*100),currency:'INR',receipt:`ccb_${Date.now()}`});}const {rows}=await q(`INSERT INTO payments(customer_id,subscription_id,booking_id,amount,currency,status,payment_method,razorpay_order_id) VALUES($1,$2,$3,$4,'INR','created','razorpay',$5) RETURNING *`,[req.user.sub,subscription_id||null,booking_id||null,amount,order?.id||null]);res.status(201).json({payment:rows[0],order});}catch(e){res.status(500).json({error:e.message});}});
 
-  if (!vehicleId || !service || !apartmentId || !scheduledDate || !scheduledTime) {
-    return res.status(400).json({ error: 'vehicle_id, service, apartment_id, scheduled_date and scheduled_time are required' });
-  }
-
-  const { rows } = await q(`
-    INSERT INTO bookings(customer_id, vehicle_id, apartment_id, parking_bay_id, service_type, scheduled_date, scheduled_time, status, customer_notes)
-    VALUES($1,$2,$3,$4,$5,$6,$7,'scheduled',$8)
-    RETURNING *
-  `, [customerId, vehicleId, apartmentId, bayId, service, scheduledDate, scheduledTime, req.body.customer_notes || null]);
-  res.status(201).json(rows[0]);
-});
-
-app.patch('/api/bookings/:id', auth, async (req, res) => {
-  const id = req.params.id;
-  const current = await q(`SELECT * FROM bookings WHERE id=$1`, [id]);
-  if (!current.rows[0]) return res.status(404).json({ error: 'Booking not found' });
-  const booking = current.rows[0];
-  if (req.user.role === 'customer' && booking.customer_id !== req.user.sub) return res.status(403).json({ error: 'Forbidden' });
-  if (req.user.role === 'partner' && booking.partner_id !== req.user.sub) return res.status(403).json({ error: 'Forbidden' });
-
-  const sets = [];
-  const vals = [];
-  const add = (column, value) => { vals.push(value); sets.push(`${column}=$${vals.length}`); };
-
-  if (req.body.status !== undefined) add('status', normalizeStatus(req.body.status));
-  if (req.body.partner_id !== undefined) add('partner_id', req.body.partner_id || null);
-  if (req.body.customer_notes !== undefined) add('customer_notes', req.body.customer_notes);
-  if (req.body.partner_notes !== undefined) add('partner_notes', req.body.partner_notes);
-  if (req.body.notes !== undefined) add(req.user.role === 'partner' ? 'partner_notes' : 'customer_notes', req.body.notes);
-  if (req.body.before_photo_url !== undefined) add('before_photo_url', req.body.before_photo_url);
-  if (req.body.after_photo_url !== undefined) add('after_photo_url', req.body.after_photo_url);
-
-  if (req.body.status && normalizeStatus(req.body.status) === 'completed') {
-    sets.push('completed_at=now()');
-  }
-  if (!sets.length) return res.status(400).json({ error: 'No editable fields' });
-
-  vals.push(id);
-  const { rows } = await q(`UPDATE bookings SET ${sets.join(', ')} WHERE id=$${vals.length} RETURNING *`, vals);
-
-  if (req.body.status && normalizeStatus(req.body.status) === 'completed') {
-    await q(`UPDATE partners SET jobs_completed=jobs_completed+1 WHERE id=$1`, [booking.partner_id || req.body.partner_id || null]).catch(() => {});
-  }
-  res.json(rows[0]);
-});
-
-app.post('/api/bookings/:id/photos', auth, upload.single('photo'), async (req, res) => {
-  if (!req.file) return res.status(400).json({ error: 'photo required' });
-  const type = req.body.type === 'after' ? 'after_photo_url' : 'before_photo_url';
-  const url = `/uploads/${req.file.filename}`;
-  const { rows } = await q(`UPDATE bookings SET ${type}=$1 WHERE id=$2 RETURNING id, ${type}`, [url, req.params.id]);
-  if (!rows[0]) return res.status(404).json({ error: 'Booking not found' });
-  res.json(rows[0]);
-});
-
-app.use('/uploads', express.static(uploadDir));
-
-app.post('/api/ratings', auth, roles('customer'), async (req, res) => {
-  const rating = req.body.rating ?? req.body.score;
-  if (!req.body.booking_id || !rating) return res.status(400).json({ error: 'booking_id and rating required' });
-  const { rows } = await q(
-    `INSERT INTO ratings(booking_id,customer_id,partner_id,rating,comment)
-     SELECT b.id,b.customer_id,b.partner_id,$3,$4 FROM bookings b
-     WHERE b.id=$1 AND b.customer_id=$2
-     RETURNING *`,
-    [req.body.booking_id, req.user.sub, Number(rating), req.body.comment || null]
-  );
-  if (!rows[0]) return res.status(404).json({ error: 'Booking not found' });
-  res.status(201).json(rows[0]);
-});
-
-app.get('/api/dashboard', auth, roles('admin'), async (_, res) => {
-  const [s, m, j, r] = await Promise.all([
-    q(`SELECT COUNT(*)::int AS n FROM subscriptions WHERE status='active'`),
-    q(`SELECT COALESCE(SUM(sp.monthly_price),0) AS n FROM subscriptions s JOIN service_plans sp ON sp.id=s.plan_id WHERE s.status='active'`),
-    q(`SELECT COUNT(*)::int AS n, COUNT(*) FILTER (WHERE status='completed')::int AS completed FROM bookings WHERE scheduled_date=CURRENT_DATE`),
-    q(`SELECT COALESCE(ROUND(AVG(rating),2),0) AS n FROM ratings`)
-  ]);
-  res.json({
-    activeSubscribers: s.rows[0].n,
-    mrr_paise: Math.round(Number(m.rows[0].n) * 100),
-    mrr: Number(m.rows[0].n),
-    todaysJobs: j.rows[0].n,
-    completed: j.rows[0].completed,
-    avgRating: Number(r.rows[0].n)
-  });
-});
-
-app.post('/api/payments/order', auth, roles('customer'), async (req, res) => {
-  if (!razorpay) return res.status(503).json({ error: 'Razorpay not configured' });
-  const amount = Number(req.body.amount_paise);
-  if (!amount) return res.status(400).json({ error: 'amount_paise required' });
-  const order = await razorpay.orders.create({ amount, currency: 'INR', receipt: `ccb_${Date.now()}` });
-  res.json(order);
-});
-
-app.post('/api/subscriptions', auth, roles('customer','admin'), async (req, res) => {
-  const customerId = req.user.role === 'admin' ? req.body.customer_id : req.user.sub;
-  const { plan_id, vehicle_id } = req.body;
-  if (!plan_id || !vehicle_id) return res.status(400).json({ error: 'plan_id and vehicle_id required' });
-  const { rows } = await q(`
-    INSERT INTO subscriptions(customer_id,vehicle_id,plan_id,status,start_date,end_date)
-    VALUES($1,$2,$3,'active',CURRENT_DATE,CURRENT_DATE + INTERVAL '1 month')
-    RETURNING *`, [customerId, vehicle_id, plan_id]);
-  res.status(201).json(rows[0]);
-});
-
-app.get('/api/jobs', auth, async (req, res) => {
-  let where = '';
-  const args = [];
-  if (req.user.role === 'customer') { where = 'WHERE b.customer_id=$1'; args.push(req.user.sub); }
-  else if (req.user.role === 'partner') { where = 'WHERE b.partner_id=$1'; args.push(req.user.sub); }
-
-  const { rows } = await q(`
-    SELECT b.id,
-           b.service_type AS service,
-           b.scheduled_time::text AS time,
-           b.status,
-           (v.make || ' ' || v.model) AS car,
-           v.registration_number AS plate,
-           (pb.tower || ' · ' || pb.floor || ' · ' || pb.bay_number) AS bay,
-           a.name AS apartment,
-           c.full_name AS customer
-    FROM bookings b
-    JOIN vehicles v ON v.id=b.vehicle_id
-    JOIN customers c ON c.id=b.customer_id
-    JOIN apartments a ON a.id=b.apartment_id
-    LEFT JOIN parking_bays pb ON pb.id=b.parking_bay_id
-    ${where}
-    ORDER BY b.scheduled_date, b.scheduled_time
-  `, args);
-  res.json(rows);
-});
-
-app.use((err, _req, res, _next) => {
-  console.error(err);
-  res.status(500).json({ error: 'Internal server error' });
-});
-
-await ensureAuthTable();
-app.listen(PORT, () => console.log(`CarCareBay API listening on :${PORT}`));
+app.use((_,res)=>res.status(404).json({error:'Route not found'}));
+app.listen(PORT,()=>console.log(`CarCareBay API listening on :${PORT}`));
