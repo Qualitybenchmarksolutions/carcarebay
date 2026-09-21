@@ -35,15 +35,18 @@ const razorpay = process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET
 const q = (text, params = []) => pool.query(text, params);
 
 async function ensureAuthTable() {
+  // The existing Supabase schema uses:
+  // auth_credentials(id, phone, password_hash, role, profile_id, created_at)
+  // where profile_id points to the corresponding profile/customer.
+  // Do not try to recreate this table with a customer_id column.
   await q(`
-    CREATE TABLE IF NOT EXISTS auth_credentials (
-      customer_id uuid PRIMARY KEY REFERENCES customers(id) ON DELETE CASCADE,
-      password_hash text NOT NULL,
-      created_at timestamptz NOT NULL DEFAULT now()
-    )
+    SELECT 1
+    FROM information_schema.tables
+    WHERE table_schema='public' AND table_name='auth_credentials'
+    LIMIT 1
   `);
 }
-ensureAuthTable().catch(e => console.error('auth_credentials setup failed:', e.message));
+ensureAuthTable().catch(e => console.error('auth_credentials check failed:', e.message));
 
 const sign = u => jwt.sign(
   { sub: u.id, role: u.role, name: u.full_name, phone: u.phone },
@@ -93,7 +96,17 @@ app.post('/api/auth/register', asyncRoute(async (req, res) => {
   `, [name || full_name, phone, email || null, apartment_id || null])).rows[0];
 
   const hash = await bcrypt.hash(password, 12);
-  await q('INSERT INTO auth_credentials(customer_id,password_hash) VALUES($1,$2)', [customer.id, hash]);
+
+  // Keep authentication credentials in the existing Supabase auth_credentials schema.
+  await q(`
+    DELETE FROM auth_credentials
+    WHERE profile_id=$1 OR phone=$2
+  `, [customer.id, phone]);
+
+  await q(`
+    INSERT INTO auth_credentials(id,phone,password_hash,role,profile_id)
+    VALUES(gen_random_uuid(),$1,$2,'customer',$3)
+  `, [phone, hash, customer.id]);
 
   res.status(201).json({ token: sign(customer), user: customer });
 }));
@@ -106,8 +119,8 @@ app.post('/api/auth/login', asyncRoute(async (req, res) => {
   const r = await q(`
     SELECT c.*, a.password_hash
     FROM customers c
-    JOIN auth_credentials a ON a.customer_id=c.id
-    WHERE c.phone=$1
+    JOIN auth_credentials a ON a.profile_id=c.id
+    WHERE a.phone=$1
     LIMIT 1
   `, [phone]);
 
@@ -133,23 +146,34 @@ app.post('/api/auth/bootstrap-admin', asyncRoute(async (req, res) => {
   }
   await ensureAuthTable();
 
-  const existing = await q('SELECT id, role FROM customers WHERE phone=$1 LIMIT 1', [phone]);
+  const existing = await q('SELECT id FROM customers WHERE phone=$1 LIMIT 1', [phone]);
   let customer;
+
   if (existing.rows.length) {
     customer = (await q(`
       UPDATE customers
       SET full_name=$1,email=$2,role='admin',status='active'
       WHERE id=$3 RETURNING *
     `, [name || full_name, email || null, existing.rows[0].id])).rows[0];
-    await q('DELETE FROM auth_credentials WHERE customer_id=$1', [customer.id]);
   } else {
     customer = (await q(`
       INSERT INTO customers(full_name,phone,email,role,status)
       VALUES($1,$2,$3,'admin','active') RETURNING *
     `, [name || full_name, phone, email || null])).rows[0];
   }
+
   const hash = await bcrypt.hash(password, 12);
-  await q('INSERT INTO auth_credentials(customer_id,password_hash) VALUES($1,$2)', [customer.id, hash]);
+
+  // Replace any credentials belonging to this phone/profile using the actual schema.
+  await q(`
+    DELETE FROM auth_credentials
+    WHERE profile_id=$1 OR phone=$2
+  `, [customer.id, phone]);
+
+  await q(`
+    INSERT INTO auth_credentials(id,phone,password_hash,role,profile_id)
+    VALUES(gen_random_uuid(),$1,$2,'admin',$3)
+  `, [phone, hash, customer.id]);
 
   res.status(201).json({ message: 'Admin created', user: customer, token: sign(customer) });
 }));
