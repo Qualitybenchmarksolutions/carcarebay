@@ -187,6 +187,84 @@ app.get('/api/plans', async (_, res) => {
   res.json(rows);
 });
 
+app.post('/api/vehicles', auth, roles('customer','admin'), async (req, res) => {
+  const customerId = req.user.role === 'admin' ? req.body.customer_id : req.user.sub;
+  const { registration_number, make, model, color = null, vehicle_type = 'car', parking_bay_id = null } = req.body;
+  if (!registration_number || !make || !model) {
+    return res.status(400).json({ error: 'registration_number, make and model are required' });
+  }
+  try {
+    const { rows } = await q(`
+      INSERT INTO vehicles(customer_id, parking_bay_id, registration_number, make, model, color, vehicle_type)
+      VALUES($1,$2,$3,$4,$5,$6,$7)
+      RETURNING *
+    `, [customerId, parking_bay_id, registration_number, make, model, color, vehicle_type]);
+    res.status(201).json(rows[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ error: 'Vehicle registration number already exists' });
+    console.error(e);
+    res.status(500).json({ error: 'Vehicle creation failed' });
+  }
+});
+
+app.get('/api/vehicles', auth, async (req, res) => {
+  const customerId = req.user.role === 'admin' ? req.query.customer_id : req.user.sub;
+  if (!customerId) return res.status(400).json({ error: 'customer_id required for admin' });
+  const { rows } = await q(`
+    SELECT v.*, pb.tower, pb.floor, pb.bay_number AS bay_number, a.name AS apartment
+    FROM vehicles v
+    LEFT JOIN parking_bays pb ON pb.id=v.parking_bay_id
+    LEFT JOIN apartments a ON a.id=pb.apartment_id
+    WHERE v.customer_id=$1
+    ORDER BY v.created_at DESC
+  `, [customerId]);
+  res.json(rows);
+});
+
+app.patch('/api/vehicles/:id', auth, roles('customer','admin'), async (req, res) => {
+  const current = await q(`SELECT * FROM vehicles WHERE id=$1`, [req.params.id]);
+  if (!current.rows[0]) return res.status(404).json({ error: 'Vehicle not found' });
+  if (req.user.role === 'customer' && current.rows[0].customer_id !== req.user.sub) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+
+  const allowed = ['registration_number','make','model','color','vehicle_type','parking_bay_id'];
+  const sets = [];
+  const vals = [];
+  for (const key of allowed) {
+    if (req.body[key] !== undefined) {
+      vals.push(req.body[key]);
+      sets.push(`${key}=$${vals.length}`);
+    }
+  }
+  if (!sets.length) return res.status(400).json({ error: 'No editable fields' });
+  vals.push(req.params.id);
+  try {
+    const { rows } = await q(`UPDATE vehicles SET ${sets.join(', ')} WHERE id=$${vals.length} RETURNING *`, vals);
+    res.json(rows[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ error: 'Vehicle registration number already exists' });
+    console.error(e);
+    res.status(500).json({ error: 'Vehicle update failed' });
+  }
+});
+
+app.delete('/api/vehicles/:id', auth, roles('customer','admin'), async (req, res) => {
+  const current = await q(`SELECT * FROM vehicles WHERE id=$1`, [req.params.id]);
+  if (!current.rows[0]) return res.status(404).json({ error: 'Vehicle not found' });
+  if (req.user.role === 'customer' && current.rows[0].customer_id !== req.user.sub) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  try {
+    await q(`DELETE FROM vehicles WHERE id=$1`, [req.params.id]);
+    res.json({ ok: true });
+  } catch (e) {
+    if (e.code === '23503') return res.status(409).json({ error: 'Vehicle cannot be deleted because it is used by an existing booking or subscription' });
+    console.error(e);
+    res.status(500).json({ error: 'Vehicle deletion failed' });
+  }
+});
+
 app.get('/api/customers', auth, roles('admin'), async (_, res) => {
   const { rows } = await q(`
     SELECT c.id, c.full_name AS name, c.phone, c.email,
