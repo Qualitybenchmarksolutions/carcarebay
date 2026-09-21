@@ -1,0 +1,12 @@
+{
+  "expo": {
+    "name": "CarCareBay",
+    "slug": "carcarebay",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "splash": {"resizeMode":"contain"},
+    "ios": {"supportsTablet":true},
+    "android": {"adaptiveIcon": {"backgroundColor":"#ffffff"}}
+  }
+}
