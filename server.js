@@ -68,6 +68,28 @@ app.post('/api/auth/register', async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: e.message }); }
 });
 
+app.post('/api/admin/bootstrap', async (req, res) => {
+  const bootstrapKey = req.headers['x-bootstrap-key'];
+  const configuredKey = process.env.ADMIN_BOOTSTRAP_KEY;
+  if (!configuredKey || bootstrapKey !== configuredKey) return res.status(403).json({ error: 'Invalid bootstrap key' });
+  const { name, full_name, phone, email, password } = req.body;
+  const adminName = full_name || name;
+  if (!adminName || !phone || !password) return bad(res, 'Name, phone and password required');
+  try {
+    await ensureAuthTable();
+    const existing = await q('SELECT id FROM customers WHERE phone=$1 LIMIT 1', [phone]);
+    const hash = await bcrypt.hash(password, 10);
+    if (existing.rowCount) {
+      const customer = await q(`UPDATE customers SET full_name=$1,email=COALESCE($2,email),role='admin',status='active' WHERE id=$3 RETURNING *`, [adminName, email || null, existing.rows[0].id]);
+      await q(`INSERT INTO auth_credentials(customer_id,password_hash) VALUES($1,$2) ON CONFLICT(customer_id) DO UPDATE SET password_hash=EXCLUDED.password_hash`, [customer.rows[0].id, hash]);
+      return res.status(200).json({ message: 'Admin account created/updated', user: customer.rows[0] });
+    }
+    const customer = await q(`INSERT INTO customers(full_name,phone,email,role,status) VALUES($1,$2,$3,'admin','active') RETURNING *`, [adminName, phone, email || null]);
+    await q('INSERT INTO auth_credentials(customer_id,password_hash) VALUES($1,$2)', [customer.rows[0].id, hash]);
+    res.status(201).json({ message: 'Admin account created', user: customer.rows[0] });
+  } catch (e) { console.error(e); res.status(500).json({ error: e.message }); }
+});
+
 app.post('/api/auth/login', async (req, res) => {
   const { phone, password } = req.body;
   if (!phone || !password) return bad(res, 'Phone number and password required');
