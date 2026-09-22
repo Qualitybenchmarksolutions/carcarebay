@@ -48,6 +48,13 @@ async function ensureAuthTable() {
 }
 ensureAuthTable().catch(e => console.error('auth_credentials check failed:', e.message));
 
+async function ensureApartmentLocationColumns() {
+  await q(`ALTER TABLE apartments ADD COLUMN IF NOT EXISTS latitude numeric`);
+  await q(`ALTER TABLE apartments ADD COLUMN IF NOT EXISTS longitude numeric`);
+  await q(`ALTER TABLE apartments ADD COLUMN IF NOT EXISTS google_place_id text`);
+}
+ensureApartmentLocationColumns().catch(e => console.error('apartment location setup failed:', e.message));
+
 const sign = u => jwt.sign(
   { sub: u.id, role: u.role, name: u.full_name, phone: u.phone },
   process.env.JWT_SECRET,
@@ -263,24 +270,73 @@ app.get('/api/apartments', auth, asyncRoute(async (req, res) => {
 }));
 
 app.post('/api/apartments', auth, roles('admin'), asyncRoute(async (req, res) => {
-  const { name, address, city, pincode, total_cars, status } = req.body;
+  const { name, address, city, pincode, total_cars, status, latitude, longitude, google_place_id } = req.body;
   if (!name) return res.status(400).json({ error: 'name is required' });
   const r = await q(`
-    INSERT INTO apartments(name,address,city,pincode,total_cars,status)
-    VALUES($1,$2,$3,$4,$5,$6) RETURNING *
-  `, [name,address || null,city || null,pincode || null,Number(total_cars || 0),status || 'active']);
+    INSERT INTO apartments(name,address,city,pincode,total_cars,status,latitude,longitude,google_place_id)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *
+  `, [name,address || null,city || null,pincode || null,Number(total_cars || 0),status || 'active',
+      latitude == null ? null : Number(latitude), longitude == null ? null : Number(longitude), google_place_id || null]);
   res.status(201).json(r.rows[0]);
 }));
 
 app.patch('/api/apartments/:id', auth, roles('admin'), asyncRoute(async (req,res)=>{
-  const fields=['name','address','city','pincode','total_cars','status'].filter(k=>Object.hasOwn(req.body,k));
+  const allowed=['name','address','city','pincode','total_cars','status','latitude','longitude','google_place_id'];
+  const fields=allowed.filter(k=>Object.hasOwn(req.body,k));
   if(!fields.length) return res.status(400).json({error:'No fields to update'});
-  const vals=fields.map(k=>req.body[k]); const set=fields.map((k,i)=>`${k}=$${i+1}`).join(',');
+  const vals=fields.map(k=>['latitude','longitude'].includes(k) && req.body[k] !== null ? Number(req.body[k]) : req.body[k]);
+  const set=fields.map((k,i)=>`${k}=$${i+1}`).join(',');
   vals.push(req.params.id);
   const r=await q(`UPDATE apartments SET ${set} WHERE id=$${vals.length} RETURNING *`,vals);
   if(!r.rows.length)return res.status(404).json({error:'Apartment not found'});
   res.json(r.rows[0]);
 }));
+
+/* ---------- GOOGLE APARTMENT MAPPING ---------- */
+
+app.post('/api/admin/apartments/search-google', auth, roles('admin'), asyncRoute(async (req,res)=>{
+  const query=String(req.body.query || '').trim();
+  if(!query)return res.status(400).json({error:'query is required'});
+  if(!process.env.GOOGLE_MAPS_API_KEY)return res.status(503).json({error:'GOOGLE_MAPS_API_KEY is not configured on Render'});
+  const response=await fetch('https://places.googleapis.com/v1/places:searchText',{
+    method:'POST',
+    headers:{
+      'Content-Type':'application/json',
+      'X-Goog-Api-Key':process.env.GOOGLE_MAPS_API_KEY,
+      'X-Goog-FieldMask':'places.id,places.displayName,places.formattedAddress,places.location,places.types'
+    },
+    body:JSON.stringify({textQuery:query,maxResultCount:10,languageCode:'en',regionCode:'IN'})
+  });
+  const data=await response.json();
+  if(!response.ok)return res.status(response.status).json({error:data.error?.message || 'Google Places search failed'});
+  res.json({places:(data.places || []).map(p=>({
+    place_id:p.id,
+    name:p.displayName?.text || '',
+    address:p.formattedAddress || '',
+    latitude:p.location?.latitude,
+    longitude:p.location?.longitude,
+    types:p.types || []
+  }))});
+}));
+
+app.get('/admin/apartments-map', (req,res)=>{
+  res.type('html').send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>CarCareBay - Map Apartments</title>
+  <style>body{font-family:Arial,sans-serif;max-width:900px;margin:30px auto;padding:0 16px;background:#f7f8fa;color:#172033}h1{margin-bottom:6px}.card{background:#fff;border:1px solid #ddd;border-radius:14px;padding:18px;margin:14px 0;box-shadow:0 2px 8px #0000000b}input,select,button{font-size:16px;padding:11px;border-radius:9px;border:1px solid #ccc}input{width:100%;box-sizing:border-box;margin:6px 0 10px}button{cursor:pointer;background:#111827;color:#fff;border:0;margin:4px}.muted{color:#687385}.result{border:1px solid #ddd;border-radius:10px;padding:12px;margin:8px 0}.ok{color:#087f5b}.err{color:#b42318}.row{display:flex;gap:8px;flex-wrap:wrap}.row>*{flex:1;min-width:180px}</style></head><body>
+  <h1>CarCareBay Apartment Mapping</h1><div class="muted">Search Google Places and save the verified coordinates to a CarCareBay apartment.</div>
+  <div class="card"><h3>1. Admin login</h3><div class="row"><input id="phone" placeholder="Admin phone"><input id="password" type="password" placeholder="Admin password"></div><button onclick="login()">Sign in</button><span id="loginMsg"></span></div>
+  <div class="card"><h3>2. Select CarCareBay apartment</h3><select id="apt" style="width:100%;padding:11px"></select><div id="aptInfo" class="muted" style="margin-top:8px"></div></div>
+  <div class="card"><h3>3. Search Google</h3><input id="query" placeholder="e.g. Prestige Lakeside Habitat, Varthur, Bengaluru"><button onclick="searchPlaces()">Search</button><div id="results"></div></div>
+  <script>
+  let token='', apartments=[];
+  const $=id=>document.getElementById(id);
+  async function login(){let r=await fetch('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone:$('phone').value,password:$('password').value})});let d=await r.json();if(!r.ok){$('loginMsg').innerHTML='<span class="err"> '+(d.error||'Login failed')+'</span>';return}token=d.token;$('loginMsg').innerHTML='<span class="ok"> Signed in</span>';loadApartments()}
+  async function loadApartments(){let r=await fetch('/api/apartments',{headers:{Authorization:'Bearer '+token}});apartments=await r.json();$('apt').innerHTML=apartments.map(a=>'<option value="'+a.id+'">'+esc(a.name)+'</option>').join('');updateInfo();}
+  $('apt').onchange=updateInfo;function updateInfo(){let a=apartments.find(x=>x.id===$('apt').value);$('aptInfo').textContent=a?(a.address||'')+' | '+(a.latitude!=null?a.latitude+', '+a.longitude:'Not mapped yet'):''}
+  async function searchPlaces(){if(!token){alert('Sign in first');return}let r=await fetch('/api/admin/apartments/search-google',{method:'POST',headers:{'Content-Type':'application/json',Authorization:'Bearer '+token},body:JSON.stringify({query:$('query').value})});let d=await r.json();if(!r.ok){$('results').innerHTML='<div class="err">'+esc(d.error||'Search failed')+'</div>';return} $('results').innerHTML=(d.places||[]).map((p,i)=>'<div class="result"><b>'+esc(p.name)+'</b><div>'+esc(p.address)+'</div><div class="muted">'+p.latitude+', '+p.longitude+'</div><button onclick="mapPlace('+i+')">Map this apartment</button></div>').join('');window.places=d.places||[]}
+  async function mapPlace(i){let p=window.places[i],id=$('apt').value;if(!id){alert('Select an apartment first');return}let r=await fetch('/api/apartments/'+id,{method:'PATCH',headers:{'Content-Type':'application/json',Authorization:'Bearer '+token},body:JSON.stringify({address:p.address,latitude:p.latitude,longitude:p.longitude,google_place_id:p.place_id})});let d=await r.json();if(!r.ok){alert(d.error||'Could not map');return}alert('Apartment mapped successfully');loadApartments()}
+  function esc(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+  </script></body></html>`);
+});
 
 /* ---------- PARKING BAYS ---------- */
 
@@ -330,10 +386,38 @@ app.post('/api/subscriptions', auth, asyncRoute(async(req,res)=>{
   if(!vehicle_id || !plan_id)return res.status(400).json({error:'vehicle_id and plan_id are required'});
   const vr=await q('SELECT id FROM vehicles WHERE id=$1 AND customer_id=$2',[vehicle_id,req.user.sub]);
   if(!vr.rows.length)return res.status(404).json({error:'Vehicle not found'});
+  const pr=await q('SELECT * FROM service_plans WHERE id=$1 AND active=true',[plan_id]);
+  if(!pr.rows.length)return res.status(404).json({error:'Plan not found'});
+
+  // A membership is paid for once at the account level and its wash credits are shared
+  // across every vehicle belonging to that customer. The selected vehicle is retained
+  // only as the subscription's anchor vehicle for compatibility with the existing schema.
+  const existing=await q(`SELECT * FROM subscriptions WHERE customer_id=$1 AND status='active' ORDER BY created_at DESC LIMIT 1`,[req.user.sub]);
+  if(existing.rows.length){
+    const current=existing.rows[0];
+    if(String(current.plan_id)===String(plan_id)){
+      const updated=(await q(`UPDATE subscriptions SET vehicle_id=$1, razorpay_subscription_id=COALESCE($2,razorpay_subscription_id) WHERE id=$3 RETURNING *`,[vehicle_id,razorpay_subscription_id || null,current.id])).rows[0];
+      return res.json(updated);
+    }
+    const updated=(await q(`UPDATE subscriptions SET vehicle_id=$1, plan_id=$2, razorpay_subscription_id=COALESCE($3,razorpay_subscription_id) WHERE id=$4 RETURNING *`,[vehicle_id,plan_id,razorpay_subscription_id || null,current.id])).rows[0];
+
+    const start=String(current.start_date || new Date().toISOString().slice(0,10)).slice(0,10);
+    const end=current.end_date ? String(current.end_date).slice(0,10) : null;
+    const countR=await q(`SELECT count(*)::int AS count FROM bookings WHERE customer_id=$1 AND status<>'cancelled' AND scheduled_date >= $2::date AND ($3::date IS NULL OR scheduled_date <= $3::date)`,[req.user.sub,start,end]);
+    const total=Number(countR.rows[0].count||0), allowance=Number(pr.rows[0].wash_credits||0), excess=Math.max(0,total-allowance);
+    if(excess>0){
+      await q(`UPDATE bookings SET status='cancelled', customer_notes=COALESCE(customer_notes,'') || CASE WHEN COALESCE(customer_notes,'')='' THEN 'Cancelled automatically after account plan change.' ELSE ' Cancelled automatically after account plan change.' END WHERE id IN (
+        SELECT id FROM bookings WHERE customer_id=$1 AND status IN ('scheduled','assigned') AND scheduled_date >= CURRENT_DATE ORDER BY scheduled_date DESC, scheduled_time DESC, created_at DESC LIMIT $2
+      )`,[req.user.sub,excess]);
+    }
+    return res.json(updated);
+  }
+
+  const startValue=start_date || new Date().toISOString().slice(0,10);
   const r=await q(`
     INSERT INTO subscriptions(customer_id,vehicle_id,plan_id,status,start_date,end_date,razorpay_subscription_id)
-    VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *
-  `,[req.user.sub,vehicle_id,plan_id,'active',start_date || new Date().toISOString().slice(0,10),end_date || null,razorpay_subscription_id || null]);
+    VALUES($1,$2,$3,'active',$4,COALESCE($5::date,($4::date + INTERVAL '1 month' - INTERVAL '1 day')::date),$6) RETURNING *
+  `,[req.user.sub,vehicle_id,plan_id,startValue,end_date || null,razorpay_subscription_id || null]);
   res.status(201).json(r.rows[0]);
 }));
 
@@ -385,11 +469,122 @@ app.get('/api/bookings', auth, asyncRoute(async(req,res)=>{
   res.json(r.rows);
 }));
 
+app.get('/api/availability', auth, asyncRoute(async(req,res)=>{
+  const {vehicle_id,date}=req.query;
+  if(!vehicle_id || !date)return res.status(400).json({error:'vehicle_id and date are required'});
+  const vr=await q('SELECT id FROM vehicles WHERE id=$1 AND customer_id=$2',[vehicle_id,req.user.sub]);
+  if(!vr.rows.length)return res.status(404).json({error:'Vehicle not found'});
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(String(date)))return res.status(400).json({error:'date must be YYYY-MM-DD'});
+
+  // Pilot operating window. This can later be configured per apartment.
+  const openingHour=8, closingHour=20, serviceMinutes=60;
+  const partnerR=await q(`SELECT count(*)::int AS count FROM partners WHERE status='active'`);
+  const activeStaff=Number(partnerR.rows[0]?.count||0);
+  const jobsR=await q(`
+    SELECT scheduled_date,scheduled_time
+    FROM bookings
+    WHERE scheduled_date=$1::date
+      AND status IN ('scheduled','assigned','in_progress')
+  `,[date]);
+  const jobs=jobsR.rows.map(r=>{
+    const [h,m]=String(r.scheduled_time).slice(0,5).split(':').map(Number);
+    return h*60+m;
+  });
+  const existingR=await q(`
+    SELECT scheduled_date,scheduled_time
+    FROM bookings
+    WHERE customer_id=$1 AND vehicle_id=$2 AND status<>'cancelled'
+      AND (scheduled_date + scheduled_time) >= ($3::date - interval '1 day')
+      AND (scheduled_date + scheduled_time) < ($3::date + interval '1 day' + interval '1 day')
+  `,[req.user.sub,vehicle_id,date]);
+  const existingVehicleTimes=existingR.rows.map(r=>({
+    date:String(r.scheduled_date).slice(0,10),
+    minutes:Number(String(r.scheduled_time).slice(0,2))*60+Number(String(r.scheduled_time).slice(3,5))
+  }));
+
+  const parts=new Intl.DateTimeFormat('en-GB',{timeZone:'Asia/Kolkata',hour:'2-digit',minute:'2-digit',hour12:false}).formatToParts(new Date());
+  const nowHour=Number(parts.find(x=>x.type==='hour')?.value||0);
+  const nowMinute=Number(parts.find(x=>x.type==='minute')?.value||0);
+  const nowParts=new Intl.DateTimeFormat('en-GB',{timeZone:'Asia/Kolkata',year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(new Date());
+  const todayParts=`${nowParts.find(x=>x.type==='year')?.value}-${nowParts.find(x=>x.type==='month')?.value}-${nowParts.find(x=>x.type==='day')?.value}`;
+  const currentMinutes=nowHour*60+nowMinute;
+  const slots=[];
+  for(let hour=openingHour;hour<closingHour;hour++){
+    const slotMinutes=hour*60;
+    const time=`${String(hour).padStart(2,'0')}:00`;
+    let available=true,reason=null;
+    if(String(date)===todayParts && slotMinutes<=currentMinutes){available=false;reason='past';}
+    const overlappingStaff=jobs.filter(start=>Math.abs(start-slotMinutes)<serviceMinutes).length;
+    const [cy,cm,cd]=String(date).split('-').map(Number);
+    const candidateMs=Date.UTC(cy,cm-1,cd,Math.floor(slotMinutes/60),slotMinutes%60);
+    const vehicleBookings=existingVehicleTimes.map(x=>{
+      const [y,m,d]=x.date.split('-').map(Number);
+      const hh=Math.floor(x.minutes/60), mm=x.minutes%60;
+      return Date.UTC(y,m-1,d,hh,mm);
+    });
+    const sameSlot=vehicleBookings.some(startMs=>startMs===candidateMs);
+    if(available && sameSlot){available=false;reason='already_booked';}
+    if(available && activeStaff<=0){available=false;reason='staff_unavailable';}
+    if(available && overlappingStaff>=activeStaff){available=false;reason='staff_unavailable';}
+    if(available && vehicleBookings.some(startMs=>candidateMs>startMs && candidateMs<startMs+4*60*60*1000)){available=false;reason='vehicle_window';}
+    slots.push({time,label:new Date(2000,0,1,hour,0).toLocaleTimeString('en-IN',{hour:'numeric',minute:'2-digit'}),available,reason});
+  }
+  res.json({date,active_staff:activeStaff,service_minutes:serviceMinutes,operating_hours:{open:`${String(openingHour).padStart(2,'0')}:00`,close:`${String(closingHour).padStart(2,'0')}:00`},slots});
+}));
+
 app.post('/api/bookings', auth, asyncRoute(async(req,res)=>{
   const {vehicle_id,apartment_id,parking_bay_id,service_type,scheduled_date,scheduled_time,customer_notes}=req.body;
   if(!vehicle_id || !service_type || !scheduled_date || !scheduled_time)return res.status(400).json({error:'vehicle_id, service_type, scheduled_date and scheduled_time are required'});
   const vr=await q('SELECT * FROM vehicles WHERE id=$1 AND customer_id=$2',[vehicle_id,req.user.sub]);
   if(!vr.rows.length)return res.status(404).json({error:'Vehicle not found'});
+
+  // Membership is account-level. One customer account has one shared wash allowance across all vehicles.
+  const subR=await q(`SELECT s.*,p.name AS plan_name,p.wash_credits FROM subscriptions s JOIN service_plans p ON p.id=s.plan_id WHERE s.customer_id=$1 AND s.status='active' ORDER BY s.created_at DESC LIMIT 1`,[req.user.sub]);
+  if(!subR.rows.length)return res.status(409).json({error:'Please activate a membership plan before booking'});
+  const sub=subR.rows[0];
+  // A vehicle needs a 4-hour service window before its NEXT booking.
+  // Important: this is forward-looking only. An existing booking at 10:00 AM
+  // blocks 10:00 AM through 1:59 PM, but it does NOT block an earlier booking
+  // such as 8:00 AM. This keeps past/earlier times independent of a later job.
+  const candidateTs = `($2::date + $3::time)`;
+  const existingSlot=await q(`
+    SELECT id, scheduled_date, scheduled_time
+    FROM bookings
+    WHERE customer_id=$1
+      AND vehicle_id=$4
+      AND status<>'cancelled'
+      AND (scheduled_date + scheduled_time) <= ${candidateTs}
+      AND (scheduled_date + scheduled_time) + interval '4 hours' > ${candidateTs}
+    ORDER BY scheduled_date DESC, scheduled_time DESC
+    LIMIT 1
+  `,[req.user.sub,scheduled_date,scheduled_time,vehicle_id]);
+  if(existingSlot.rows.length){
+    const b=existingSlot.rows[0];
+    return res.status(409).json({error:`This vehicle already has a booking at ${String(b.scheduled_time).slice(0,5)} on ${String(b.scheduled_date).slice(0,10)}. The next booking for this vehicle must be at least 4 hours later.`});
+  }
+  const maxBookingDate = new Date();
+  maxBookingDate.setHours(0,0,0,0);
+  maxBookingDate.setDate(maxBookingDate.getDate()+15);
+  const requestedDateObj = new Date(`${scheduled_date}T00:00:00`);
+  if(Number.isNaN(requestedDateObj.getTime()) || requestedDateObj > maxBookingDate || requestedDateObj < new Date(new Date().setHours(0,0,0,0)))return res.status(409).json({error:'Bookings can be made only within the next 15 days.'});
+  const requestedHour=Number(String(scheduled_time).slice(0,2));
+  const requestedMinute=Number(String(scheduled_time).slice(3,5));
+  const requestedMinutes=requestedHour*60+requestedMinute;
+  if(!Number.isFinite(requestedMinutes) || requestedMinutes<8*60 || requestedMinutes>=20*60)return res.status(409).json({error:'Bookings are available between 8:00 AM and 8:00 PM. Please choose an available slot.'});
+  const staffR=await q(`SELECT count(*)::int AS count FROM partners WHERE status='active'`);
+  const activeStaff=Number(staffR.rows[0]?.count||0);
+  if(activeStaff<=0)return res.status(409).json({error:'No CarCare staff are available for booking right now. Please choose another time.'});
+  const staffConflict=await q(`
+    SELECT count(*)::int AS count
+    FROM bookings
+    WHERE scheduled_date=$1::date
+      AND status IN ('scheduled','assigned','in_progress')
+      AND abs(extract(epoch FROM ((scheduled_date + scheduled_time) - ($2::date + $3::time)))) < 3600
+  `,[scheduled_date,scheduled_date,scheduled_time]);
+  if(Number(staffConflict.rows[0]?.count||0)>=activeStaff)return res.status(409).json({error:'All CarCare staff are already booked around this time. Please choose an available slot.'});
+  const countR=await q(`SELECT count(*)::int AS count FROM bookings WHERE customer_id=$1 AND status<>'cancelled' AND scheduled_date >= $2::date AND ($3::date IS NULL OR scheduled_date <= $3::date)`,[req.user.sub,sub.start_date,sub.end_date || null]);
+  const used=Number(countR.rows[0].count||0), allowance=Number(sub.wash_credits||0);
+  if(used>=allowance)return res.status(409).json({error:`Your ${sub.plan_name} plan has used all ${allowance} exterior wash credits. Please switch to a higher plan.`});
   const r=await q(`
     INSERT INTO bookings(customer_id,vehicle_id,apartment_id,parking_bay_id,service_type,scheduled_date,scheduled_time,status,customer_notes)
     VALUES($1,$2,$3,$4,$5,$6,$7,'scheduled',$8) RETURNING *
@@ -400,6 +595,62 @@ app.post('/api/bookings', auth, asyncRoute(async(req,res)=>{
 app.patch('/api/bookings/:id', auth, asyncRoute(async(req,res)=>{
   const fields=['parking_bay_id','service_type','scheduled_date','scheduled_time','status','customer_notes','partner_notes','partner_id','before_photo_url','after_photo_url','started_at','completed_at'].filter(k=>Object.hasOwn(req.body,k));
   if(!fields.length)return res.status(400).json({error:'No fields to update'});
+  const existing=(await q('SELECT * FROM bookings WHERE id=$1',[req.params.id])).rows[0];
+  if(!existing)return res.status(404).json({error:'Booking not found'});
+  if(req.user.role==='customer' && existing.customer_id!==req.user.sub)return res.status(404).json({error:'Booking not found or not permitted'});
+  if(req.user.role==='partner' && existing.partner_id!==req.user.sub)return res.status(404).json({error:'Booking not found or not permitted'});
+
+  if(req.user.role==='customer' && (Object.hasOwn(req.body,'scheduled_date') || Object.hasOwn(req.body,'scheduled_time') || Object.hasOwn(req.body,'vehicle_id'))){
+    const newDate=req.body.scheduled_date || existing.scheduled_date;
+    const newTime=req.body.scheduled_time || existing.scheduled_time;
+    // Apply the same forward-only 4-hour rule when modifying a booking.
+    const candidateTs = `($2::date + $3::time)`;
+    const conflict=await q(`
+      SELECT id, scheduled_date, scheduled_time
+      FROM bookings
+      WHERE customer_id=$1
+        AND vehicle_id=$4
+        AND status<>'cancelled'
+        AND id<>$5
+        AND (scheduled_date + scheduled_time) <= ${candidateTs}
+        AND (scheduled_date + scheduled_time) + interval '4 hours' > ${candidateTs}
+      ORDER BY scheduled_date DESC, scheduled_time DESC
+      LIMIT 1
+    `,[req.user.sub,newDate,newTime,req.body.vehicle_id || existing.vehicle_id,req.params.id]);
+    if(conflict.rows.length){
+      const b=conflict.rows[0];
+      return res.status(409).json({error:`This vehicle already has a booking at ${String(b.scheduled_time).slice(0,5)} on ${String(b.scheduled_date).slice(0,10)}. The next booking for this vehicle must be at least 4 hours later.`});
+    }
+        const maxBookingDate = new Date();
+    maxBookingDate.setHours(0,0,0,0);
+    maxBookingDate.setDate(maxBookingDate.getDate()+15);
+    const requestedDateObj = new Date(`${newDate}T00:00:00`);
+    if(Number.isNaN(requestedDateObj.getTime()) || requestedDateObj > maxBookingDate || requestedDateObj < new Date(new Date().setHours(0,0,0,0)))return res.status(409).json({error:'Bookings can be made only within the next 15 days.'});
+    const requestedHour=Number(String(newTime).slice(0,2));
+    const requestedMinute=Number(String(newTime).slice(3,5));
+    const requestedMinutes=requestedHour*60+requestedMinute;
+    if(!Number.isFinite(requestedMinutes) || requestedMinutes<8*60 || requestedMinutes>=20*60)return res.status(409).json({error:'Bookings are available between 8:00 AM and 8:00 PM. Please choose an available slot.'});
+const staffR=await q(`SELECT count(*)::int AS count FROM partners WHERE status='active'`);
+    const activeStaff=Number(staffR.rows[0]?.count||0);
+    if(activeStaff<=0)return res.status(409).json({error:'No CarCare staff are available for booking right now. Please choose another time.'});
+    const staffConflict=await q(`
+      SELECT count(*)::int AS count
+      FROM bookings
+      WHERE scheduled_date=$1::date
+        AND status IN ('scheduled','assigned','in_progress')
+        AND id<>$4
+        AND abs(extract(epoch FROM ((scheduled_date + scheduled_time) - ($2::date + $3::time)))) < 3600
+    `,[newDate,newDate,newTime,req.params.id]);
+    if(Number(staffConflict.rows[0]?.count||0)>=activeStaff)return res.status(409).json({error:'All CarCare staff are already booked around this time. Please choose an available slot.'});
+    const vehicleId=req.body.vehicle_id || existing.vehicle_id;
+    const subR=await q(`SELECT s.*,p.name AS plan_name,p.wash_credits FROM subscriptions s JOIN service_plans p ON p.id=s.plan_id WHERE s.customer_id=$1 AND s.status='active' ORDER BY s.created_at DESC LIMIT 1`,[req.user.sub]);
+    if(!subR.rows.length)return res.status(409).json({error:'Please activate a membership plan before modifying this booking'});
+    const sub=subR.rows[0];
+    const countR=await q(`SELECT count(*)::int AS count FROM bookings WHERE customer_id=$1 AND status<>'cancelled' AND scheduled_date >= $2::date AND ($3::date IS NULL OR scheduled_date <= $3::date)`,[req.user.sub,sub.start_date,sub.end_date || null]);
+    const used=Number(countR.rows[0].count||0);
+    if(used>Number(sub.wash_credits||0))return res.status(409).json({error:`Your ${sub.plan_name} plan does not have enough wash credits for this booking.`});
+  }
+
   const vals=fields.map(k=>req.body[k]); const set=fields.map((k,i)=>`${k}=$${i+1}`).join(',');
   vals.push(req.params.id);
   let where=`id=$${vals.length}`;
