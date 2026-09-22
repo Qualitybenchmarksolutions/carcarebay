@@ -52,6 +52,7 @@ async function ensureApartmentLocationColumns() {
   await q(`ALTER TABLE apartments ADD COLUMN IF NOT EXISTS latitude numeric`);
   await q(`ALTER TABLE apartments ADD COLUMN IF NOT EXISTS longitude numeric`);
   await q(`ALTER TABLE apartments ADD COLUMN IF NOT EXISTS google_place_id text`);
+  await q(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS profile_photo_url text`);
 }
 ensureApartmentLocationColumns().catch(e => console.error('apartment location setup failed:', e.message));
 
@@ -188,6 +189,18 @@ app.post('/api/auth/bootstrap-admin', asyncRoute(async (req, res) => {
 app.get('/api/me', auth, asyncRoute(async (req, res) => {
   const r = await q('SELECT * FROM customers WHERE id=$1', [req.user.sub]);
   if (!r.rows.length) return res.status(404).json({ error: 'Customer not found' });
+  res.json(r.rows[0]);
+}));
+
+app.patch('/api/me', auth, asyncRoute(async (req, res) => {
+  const allowed=['full_name','email','profile_photo_url'];
+  const fields=allowed.filter(k=>Object.prototype.hasOwnProperty.call(req.body,k));
+  if(!fields.length)return res.status(400).json({error:'No fields to update'});
+  const vals=fields.map(k=>req.body[k]);
+  const set=fields.map((k,i)=>`${k}=$${i+1}`).join(',');
+  vals.push(req.user.sub);
+  const r=await q(`UPDATE customers SET ${set} WHERE id=$${vals.length} RETURNING *`,vals);
+  if(!r.rows.length)return res.status(404).json({error:'Customer not found'});
   res.json(r.rows[0]);
 }));
 
@@ -477,7 +490,7 @@ app.get('/api/availability', auth, asyncRoute(async(req,res)=>{
   if(!/^\d{4}-\d{2}-\d{2}$/.test(String(date)))return res.status(400).json({error:'date must be YYYY-MM-DD'});
 
   // Pilot operating window. This can later be configured per apartment.
-  const openingHour=8, closingHour=20, serviceMinutes=60;
+  const openingHour=10, closingHour=17, serviceMinutes=60;
   const partnerR=await q(`SELECT count(*)::int AS count FROM partners WHERE status='active'`);
   const activeStaff=Number(partnerR.rows[0]?.count||0);
   const jobsR=await q(`
@@ -570,7 +583,7 @@ app.post('/api/bookings', auth, asyncRoute(async(req,res)=>{
   const requestedHour=Number(String(scheduled_time).slice(0,2));
   const requestedMinute=Number(String(scheduled_time).slice(3,5));
   const requestedMinutes=requestedHour*60+requestedMinute;
-  if(!Number.isFinite(requestedMinutes) || requestedMinutes<8*60 || requestedMinutes>=20*60)return res.status(409).json({error:'Bookings are available between 8:00 AM and 8:00 PM. Please choose an available slot.'});
+  if(!Number.isFinite(requestedMinutes) || requestedMinutes<10*60 || requestedMinutes>=17*60)return res.status(409).json({error:'Bookings are available between 10:00 AM and 5:00 PM. Please choose an available slot.'});
   const staffR=await q(`SELECT count(*)::int AS count FROM partners WHERE status='active'`);
   const activeStaff=Number(staffR.rows[0]?.count||0);
   if(activeStaff<=0)return res.status(409).json({error:'No CarCare staff are available for booking right now. Please choose another time.'});
@@ -629,7 +642,7 @@ app.patch('/api/bookings/:id', auth, asyncRoute(async(req,res)=>{
     const requestedHour=Number(String(newTime).slice(0,2));
     const requestedMinute=Number(String(newTime).slice(3,5));
     const requestedMinutes=requestedHour*60+requestedMinute;
-    if(!Number.isFinite(requestedMinutes) || requestedMinutes<8*60 || requestedMinutes>=20*60)return res.status(409).json({error:'Bookings are available between 8:00 AM and 8:00 PM. Please choose an available slot.'});
+    if(!Number.isFinite(requestedMinutes) || requestedMinutes<10*60 || requestedMinutes>=17*60)return res.status(409).json({error:'Bookings are available between 10:00 AM and 5:00 PM. Please choose an available slot.'});
 const staffR=await q(`SELECT count(*)::int AS count FROM partners WHERE status='active'`);
     const activeStaff=Number(staffR.rows[0]?.count||0);
     if(activeStaff<=0)return res.status(409).json({error:'No CarCare staff are available for booking right now. Please choose another time.'});
@@ -804,7 +817,8 @@ app.get('/api/dashboard', auth, asyncRoute(async(req,res)=>{
 
 app.post('/api/uploads', auth, upload.single('file'), (req,res)=>{
   if(!req.file)return res.status(400).json({error:'file is required'});
-  res.status(201).json({filename:req.file.filename,original_name:req.file.originalname,path:`/uploads/${req.file.filename}`});
+  const pathUrl=`/uploads/${req.file.filename}`;
+  res.status(201).json({filename:req.file.filename,original_name:req.file.originalname,path:pathUrl,url:`${req.protocol}://${req.get('host')}${pathUrl}`});
 });
 app.use('/uploads', express.static(uploadDir));
 
