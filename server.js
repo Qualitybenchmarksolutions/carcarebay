@@ -22,7 +22,7 @@ const pool = new Pool({
 
 const origins = (process.env.CORS_ORIGINS || '*').split(',').map(s => s.trim());
 app.use(cors({ origin: (o, cb) => cb(null, !o || origins.includes('*') || origins.includes(o)) }));
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({ limit: '10mb' }));
 
 const uploadDir = path.resolve(process.env.STORAGE_DIR || './uploads');
 fs.mkdirSync(uploadDir, { recursive: true });
@@ -814,6 +814,19 @@ app.get('/api/dashboard', auth, asyncRoute(async(req,res)=>{
 }));
 
 /* ---------- UPLOADS ---------- */
+
+app.post('/api/uploads/base64', auth, asyncRoute(async (req,res)=>{
+  const {base64,mime,name} = req.body || {};
+  if(!base64) return res.status(400).json({error:'base64 image data is required'});
+  const clean=String(base64).replace(/^data:[^;]+;base64,/,'');
+  if(clean.length > 8 * 1024 * 1024) return res.status(413).json({error:'Image is too large. Please choose a smaller photo.'});
+  const ext=(String(name||'profile.jpg').split('.').pop()||'jpg').toLowerCase().replace(/[^a-z0-9]/g,'') || 'jpg';
+  const filename=`profile-${req.user.sub}-${Date.now()}.${ext}`;
+  const filePath=path.join(uploadDir,filename);
+  fs.writeFileSync(filePath,Buffer.from(clean,'base64'));
+  const pathUrl=`/uploads/${filename}`;
+  res.status(201).json({filename,path:pathUrl,url:`${req.protocol}://${req.get('host')}${pathUrl}`});
+}));
 
 app.post('/api/uploads', auth, upload.single('file'), (req,res)=>{
   if(!req.file)return res.status(400).json({error:'file is required'});
