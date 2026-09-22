@@ -48,6 +48,13 @@ async function ensureAuthTable() {
 }
 ensureAuthTable().catch(e => console.error('auth_credentials check failed:', e.message));
 
+async function ensureProfileFields() {
+  await q(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS profile_photo_url text`);
+  await q(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS profile_interests text[] NOT NULL DEFAULT '{}'`);
+  await q(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS profile_quote text`);
+}
+ensureProfileFields().catch(e => console.error('profile fields setup failed:', e.message));
+
 async function ensureApartmentLocationColumns() {
   await q(`ALTER TABLE apartments ADD COLUMN IF NOT EXISTS latitude numeric`);
   await q(`ALTER TABLE apartments ADD COLUMN IF NOT EXISTS longitude numeric`);
@@ -187,13 +194,15 @@ app.post('/api/auth/bootstrap-admin', asyncRoute(async (req, res) => {
 }));
 
 app.get('/api/me', auth, asyncRoute(async (req, res) => {
+  await ensureProfileFields();
   const r = await q('SELECT * FROM customers WHERE id=$1', [req.user.sub]);
   if (!r.rows.length) return res.status(404).json({ error: 'Customer not found' });
   res.json(r.rows[0]);
 }));
 
 app.patch('/api/me', auth, asyncRoute(async (req, res) => {
-  const allowed=['full_name','email','profile_photo_url'];
+  await ensureProfileFields();
+  const allowed=['full_name','email','profile_photo_url','profile_interests','profile_quote'];
   const fields=allowed.filter(k=>Object.prototype.hasOwnProperty.call(req.body,k));
   if(!fields.length)return res.status(400).json({error:'No fields to update'});
   const vals=fields.map(k=>req.body[k]);
