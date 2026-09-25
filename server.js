@@ -420,7 +420,6 @@ app.delete('/api/vehicles/:id', auth, asyncRoute(async (req, res) => {
   // Ensure the archive column exists before this request. This avoids a race where
   // a freshly restarted Render instance receives a delete before startup migrations finish.
   await ensureVehicleArchiveField();
-  await ensureSubscriptionAccountLevel();
 
   const vehicleId=String(req.params.id);
   const current=(await q('SELECT * FROM vehicles WHERE id=$1 AND customer_id=$2 AND deleted_at IS NULL',[vehicleId,req.user.sub])).rows[0];
@@ -990,10 +989,8 @@ app.post('/api/subscriptions/checkout', auth, asyncRoute(async(req,res)=>{
   if(!plan_id) return res.status(400).json({error:'plan_id is required'});
   if(!razorpay) return res.status(503).json({error:'Razorpay is not configured. Add RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET in Render.'});
 
-  const [vr,pr]=await Promise.all([
-    q('SELECT id,make,model,registration_number FROM vehicles WHERE id=$1 AND customer_id=$2',[vehicle_id,req.user.sub]),
-    q('SELECT id,name,monthly_price,active FROM service_plans WHERE id=$1',[plan_id])
-  ]);
+  // Memberships are account-level; checkout must not require or attach a vehicle.
+  const pr=await q('SELECT id,name,monthly_price,active FROM service_plans WHERE id=$1',[plan_id]);
   if(!pr.rows.length || !pr.rows[0].active) return res.status(404).json({error:'Plan not found'});
 
   const amount=Number(pr.rows[0].monthly_price);
@@ -1014,8 +1011,7 @@ app.post('/api/subscriptions/checkout', auth, asyncRoute(async(req,res)=>{
     key_id:process.env.RAZORPAY_KEY_ID,
     order,
     payment:r.rows[0],
-    plan:{id:pr.rows[0].id,name:pr.rows[0].name,monthly_price:amount},
-    vehicle:vr.rows[0]
+    plan:{id:pr.rows[0].id,name:pr.rows[0].name,monthly_price:amount}
   });
 }));
 
@@ -1130,7 +1126,7 @@ app.post('/api/subscriptions/payment-link', auth, asyncRoute(async(req,res)=>{
   const {plan_id}=req.body || {};
   if(!plan_id) return res.status(400).json({error:'plan_id is required'});
   if(!razorpay) return res.status(503).json({error:'Razorpay is not configured. Add RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET in Render.'});
-  const [vr,pr,cr]=await Promise.all([
+  const [pr,cr]=await Promise.all([
     q('SELECT id,name,monthly_price,active FROM service_plans WHERE id=$1',[plan_id]),
     q('SELECT id,full_name,email,phone FROM customers WHERE id=$1',[req.user.sub])
   ]);
