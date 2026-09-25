@@ -77,6 +77,17 @@ async function ensurePaymentFields() {
 }
 ensurePaymentFields().catch(e => console.error('payment fields setup failed:', e.message));
 
+async function ensureSubscriptionCreditFields() {
+  await q(`ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS carryover_exterior integer NOT NULL DEFAULT 0`);
+  await q(`ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS carryover_interior integer NOT NULL DEFAULT 0`);
+}
+ensureSubscriptionCreditFields().catch(e => console.error('subscription credit fields setup failed:', e.message));
+
+async function ensureVehicleArchiveField() {
+  await q(`ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS deleted_at timestamptz`);
+}
+ensureVehicleArchiveField().catch(e => console.error('vehicle archive setup failed:', e.message));
+
 async function ensureApartmentLocationColumns() {
   await q(`ALTER TABLE apartments ADD COLUMN IF NOT EXISTS latitude numeric`);
   await q(`ALTER TABLE apartments ADD COLUMN IF NOT EXISTS longitude numeric`);
@@ -170,19 +181,21 @@ async function activatePaidMembership(paymentId, customerId, razorpayPaymentId=n
     const existing=(await client.query(`SELECT * FROM subscriptions WHERE customer_id=$1 AND status='active' ORDER BY created_at DESC LIMIT 1 FOR UPDATE`,[customerId])).rows[0];
     let subscription;
     if(existing){
-      subscription=(await client.query(`UPDATE subscriptions SET vehicle_id=$1,plan_id=$2 WHERE id=$3 RETURNING *`,[locked.vehicle_id,locked.plan_id,existing.id])).rows[0];
       const start=dateOnly(existing.start_date,new Date().toISOString().slice(0,10));
       const end=dateOnly(existing.end_date,null);
-      let countSql=`SELECT count(*)::int AS count FROM bookings WHERE customer_id=$1 AND status <> 'cancelled' AND scheduled_date >= $2::date`;
-      const countParams=[customerId,start];
-      if(end){countSql+=' AND scheduled_date <= $3::date';countParams.push(end);}
-      const total=Number((await client.query(countSql,countParams)).rows[0]?.count||0);
-      const allowance=Math.max(0,Number(plan.wash_credits||0));
-      const excess=Math.max(0,total-allowance);
-      if(excess>0) await client.query(`UPDATE bookings SET status='cancelled',customer_notes=CASE WHEN COALESCE(customer_notes,'')='' THEN 'Cancelled automatically after account plan change.' ELSE customer_notes || ' Cancelled automatically after account plan change.' END WHERE id IN (SELECT id FROM bookings WHERE customer_id=$1 AND status IN ('scheduled','assigned') AND scheduled_date >= CURRENT_DATE ORDER BY scheduled_date DESC, scheduled_time DESC NULLS LAST, created_at DESC LIMIT $2::int)`,[customerId,excess]);
+      let consumedSql=`SELECT count(*)::int AS count FROM bookings WHERE customer_id=$1 AND status IN ('completed','in_progress') AND scheduled_date >= $2::date`;
+      const consumedParams=[customerId,start];
+      if(end){consumedSql+=' AND scheduled_date <= $3::date';consumedParams.push(end);}
+      const consumed=Number((await client.query(consumedSql,consumedParams)).rows[0]?.count||0);
+      const oldPlan=(await client.query('SELECT wash_credits FROM service_plans WHERE id=$1',[existing.plan_id])).rows[0];
+      const oldTotal=Number(existing.carryover_exterior||0)+Number(oldPlan?.wash_credits||0);
+      // Carry forward unused credits from the old membership. Future bookings are reserved
+      // against the new total, but they are not treated as already-consumed credits.
+      const carryover=Math.max(0,oldTotal-consumed);
+      subscription=(await client.query(`UPDATE subscriptions SET vehicle_id=$1,plan_id=$2,carryover_exterior=$3,carryover_interior=0 WHERE id=$4 RETURNING *`,[locked.vehicle_id,locked.plan_id,carryover,existing.id])).rows[0];
     }else{
       const startValue=new Date().toISOString().slice(0,10);
-      subscription=(await client.query(`INSERT INTO subscriptions(customer_id,vehicle_id,plan_id,status,start_date,end_date) VALUES($1,$2,$3,'active',$4,(($4::date + INTERVAL '1 month' - INTERVAL '1 day')::date)) RETURNING *`,[customerId,locked.vehicle_id,locked.plan_id,startValue])).rows[0];
+      subscription=(await client.query(`INSERT INTO subscriptions(customer_id,vehicle_id,plan_id,status,start_date,end_date,carryover_exterior,carryover_interior) VALUES($1,$2,$3,'active',$4,(($4::date + INTERVAL '1 month' - INTERVAL '1 day')::date),0,0) RETURNING *`,[customerId,locked.vehicle_id,locked.plan_id,startValue])).rows[0];
     }
     await client.query('UPDATE payments SET subscription_id=$1 WHERE id=$2',[subscription.id,paymentId]);
     await client.query('COMMIT');
@@ -340,7 +353,7 @@ app.get('/api/plans', asyncRoute(async (_, res) => {
 /* ---------- VEHICLES ---------- */
 
 app.get('/api/vehicles', auth, asyncRoute(async (req, res) => {
-  const r = await q('SELECT * FROM vehicles WHERE customer_id=$1 ORDER BY created_at DESC', [req.user.sub]);
+  const r = await q('SELECT * FROM vehicles WHERE customer_id=$1 AND deleted_at IS NULL ORDER BY created_at DESC', [req.user.sub]);
   res.json(r.rows);
 }));
 
@@ -349,41 +362,89 @@ app.post('/api/vehicles', auth, asyncRoute(async (req, res) => {
   if (!registration_number) return res.status(400).json({ error: 'registration_number is required' });
 
   if (parking_bay_id) {
-    const bay = await q('SELECT id FROM parking_bays WHERE id=$1 LIMIT 1', [parking_bay_id]);
+    const bay = await q(`SELECT id,status FROM parking_bays WHERE id=$1 LIMIT 1`, [parking_bay_id]);
     if (!bay.rows.length) return res.status(400).json({ error: 'Parking bay not found', parking_bay_id });
+    if (String(bay.rows[0].status || 'available').toLowerCase() !== 'available') return res.status(409).json({ error: 'This parking bay is already assigned.' });
+    const occupied = await q('SELECT id FROM vehicles WHERE parking_bay_id=$1 AND deleted_at IS NULL LIMIT 1',[parking_bay_id]);
+    if (occupied.rows.length) return res.status(409).json({ error: 'This parking bay is already assigned to another vehicle.' });
   }
 
-  const existing = await q(
-    'SELECT * FROM vehicles WHERE customer_id=$1 AND registration_number=$2 LIMIT 1',
-    [req.user.sub, registration_number]
-  );
-  if (existing.rows.length) {
-    return res.status(409).json({ error: 'Vehicle with this registration number already exists', vehicle: existing.rows[0] });
-  }
+  const existing = await q('SELECT * FROM vehicles WHERE customer_id=$1 AND registration_number=$2 AND deleted_at IS NULL LIMIT 1',[req.user.sub, registration_number]);
+  if (existing.rows.length) return res.status(409).json({ error: 'Vehicle with this registration number already exists', vehicle: existing.rows[0] });
 
-  const r = await q(`
-    INSERT INTO vehicles(customer_id,parking_bay_id,registration_number,make,model,color,vehicle_type)
-    VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *
-  `, [req.user.sub, parking_bay_id || null, registration_number, make || null, model || null, color || null, vehicle_type || 'car']);
+  const r = await q(`INSERT INTO vehicles(customer_id,parking_bay_id,registration_number,make,model,color,vehicle_type) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *`, [req.user.sub, parking_bay_id || null, registration_number, make || null, model || null, color || null, vehicle_type || 'car']);
+  if(parking_bay_id) await q(`UPDATE parking_bays SET status='occupied' WHERE id=$1`,[parking_bay_id]);
   res.status(201).json(r.rows[0]);
 }));
 
 app.patch('/api/vehicles/:id', auth, asyncRoute(async (req, res) => {
+  const current=(await q('SELECT * FROM vehicles WHERE id=$1 AND customer_id=$2 AND deleted_at IS NULL',[req.params.id,req.user.sub])).rows[0];
+  if(!current) return res.status(404).json({error:'Vehicle not found'});
   const allowed = ['make','model','registration_number','color','vehicle_type','parking_bay_id'];
   const fields = allowed.filter(k => Object.prototype.hasOwnProperty.call(req.body, k));
   if (!fields.length) return res.status(400).json({ error: 'No fields to update' });
+  if(req.body.registration_number){
+    const dup=await q('SELECT id FROM vehicles WHERE customer_id=$1 AND registration_number=$2 AND id<>$3 AND deleted_at IS NULL LIMIT 1',[req.user.sub,req.body.registration_number,req.params.id]);
+    if(dup.rows.length) return res.status(409).json({error:'Another vehicle already uses this registration number.'});
+  }
+  if(Object.prototype.hasOwnProperty.call(req.body,'parking_bay_id')){
+    const newBay=req.body.parking_bay_id || null;
+    if(newBay && newBay!==current.parking_bay_id){
+      const bay=(await q(`SELECT id,status FROM parking_bays WHERE id=$1 LIMIT 1`,[newBay])).rows[0];
+      if(!bay) return res.status(400).json({error:'Parking bay not found'});
+      if(String(bay.status||'available').toLowerCase()!=='available') return res.status(409).json({error:'This parking bay is already occupied.'});
+      const occupied=await q('SELECT id FROM vehicles WHERE parking_bay_id=$1 AND id<>$2 AND deleted_at IS NULL LIMIT 1',[newBay,req.params.id]);
+      if(occupied.rows.length) return res.status(409).json({error:'This parking bay is already assigned to another vehicle.'});
+    }
+  }
   const vals = fields.map(k => req.body[k]);
   const set = fields.map((k,i) => `${k}=$${i+1}`).join(',');
   vals.push(req.params.id, req.user.sub);
   const r = await q(`UPDATE vehicles SET ${set} WHERE id=$${vals.length-1} AND customer_id=$${vals.length} RETURNING *`, vals);
-  if (!r.rows.length) return res.status(404).json({ error: 'Vehicle not found' });
-  res.json(r.rows[0]);
+  const updated=r.rows[0];
+  if(Object.prototype.hasOwnProperty.call(req.body,'parking_bay_id') && String(current.parking_bay_id||'')!==String(updated.parking_bay_id||'')){
+    if(current.parking_bay_id) await q(`UPDATE parking_bays SET status='available' WHERE id=$1 AND NOT EXISTS(SELECT 1 FROM vehicles WHERE parking_bay_id=$1)`,[current.parking_bay_id]);
+    if(updated.parking_bay_id) await q(`UPDATE parking_bays SET status='occupied' WHERE id=$1`,[updated.parking_bay_id]);
+  }
+  res.json(updated);
 }));
 
 app.delete('/api/vehicles/:id', auth, asyncRoute(async (req, res) => {
-  const r = await q('DELETE FROM vehicles WHERE id=$1 AND customer_id=$2 RETURNING id', [req.params.id, req.user.sub]);
-  if (!r.rows.length) return res.status(404).json({ error: 'Vehicle not found' });
-  res.json({ ok: true });
+  // Ensure the archive column exists before this request. This avoids a race where
+  // a freshly restarted Render instance receives a delete before startup migrations finish.
+  await ensureVehicleArchiveField();
+
+  const vehicleId=String(req.params.id);
+  const current=(await q('SELECT * FROM vehicles WHERE id=$1 AND customer_id=$2 AND deleted_at IS NULL',[vehicleId,req.user.sub])).rows[0];
+  if(!current) return res.status(404).json({error:'Vehicle not found or already deleted'});
+
+  const activeSub=await q(`SELECT id FROM subscriptions WHERE customer_id=$1 AND vehicle_id=$2 AND status='active' LIMIT 1`,[req.user.sub,vehicleId]);
+  if(activeSub.rows.length) return res.status(409).json({error:'This vehicle is linked to your active membership. Switch the membership to another vehicle before deleting it.'});
+
+  const activeBookings=await q(`SELECT id FROM bookings WHERE customer_id=$1 AND vehicle_id=$2 AND LOWER(COALESCE(status,'')) NOT IN ('completed','cancelled') LIMIT 1`,[req.user.sub,vehicleId]);
+  if(activeBookings.rows.length) return res.status(409).json({error:'This vehicle has an upcoming or active booking. Cancel or complete that booking before deleting the vehicle.'});
+
+  const client=await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const archived=await client.query('UPDATE vehicles SET deleted_at=NOW(), parking_bay_id=NULL WHERE id=$1 AND customer_id=$2 AND deleted_at IS NULL RETURNING parking_bay_id',[vehicleId,req.user.sub]);
+    if(!archived.rows.length){
+      await client.query('ROLLBACK');
+      return res.status(404).json({error:'Vehicle was not found or was already deleted'});
+    }
+    const bayId=current.parking_bay_id;
+    if(bayId){
+      await client.query(`UPDATE parking_bays SET status='available' WHERE id=$1 AND NOT EXISTS(SELECT 1 FROM vehicles WHERE parking_bay_id=$1 AND deleted_at IS NULL)`,[bayId]);
+    }
+    await client.query('COMMIT');
+    return res.json({ok:true,archived:true,vehicle_id:vehicleId,parking_bay_released:Boolean(bayId)});
+  } catch(e) {
+    try { await client.query('ROLLBACK'); } catch {}
+    console.error('Vehicle archive failed:',e);
+    return res.status(500).json({error:'Could not delete vehicle',detail:process.env.NODE_ENV==='production' ? undefined : e.message});
+  } finally {
+    client.release();
+  }
 }));
 
 /* ---------- APARTMENTS ---------- */
@@ -500,7 +561,7 @@ app.patch('/api/parking-bays/:id', auth, roles('admin'), asyncRoute(async(req,re
 
 app.get('/api/subscriptions', auth, asyncRoute(async(req,res)=>{
   const r=await q(`
-    SELECT s.*, p.name AS plan_name, p.monthly_price, v.registration_number
+    SELECT s.*, p.name AS plan_name, p.monthly_price, p.wash_credits, p.interior_credits, (p.wash_credits + COALESCE(s.carryover_exterior,0)) AS total_exterior_credits, (p.interior_credits + COALESCE(s.carryover_interior,0)) AS total_interior_credits, v.registration_number
     FROM subscriptions s
     JOIN service_plans p ON p.id=s.plan_id
     JOIN vehicles v ON v.id=s.vehicle_id
@@ -552,53 +613,20 @@ app.post('/api/subscriptions', auth, asyncRoute(async(req,res)=>{
         return res.json(updated);
       }
 
-      const updated=(await client.query(`
-        UPDATE subscriptions
-        SET vehicle_id=$1,
-            plan_id=$2,
-            razorpay_subscription_id=COALESCE($3,razorpay_subscription_id)
-        WHERE id=$4 AND customer_id=$5
-        RETURNING *
-      `,[vehicle_id,plan_id,razorpay_subscription_id || null,current.id,req.user.sub])).rows[0];
-
-      // Keep already completed work as consumed credits. If the new plan has fewer
-      // credits than the account has used/booked, cancel only the latest future
-      // scheduled/assigned bookings until the account is within its allowance.
       const start=dateOnly(current.start_date,start_date || new Date().toISOString().slice(0,10));
       const end=dateOnly(current.end_date,null);
-      let countSql=`
-        SELECT count(*)::int AS count
-        FROM bookings
-        WHERE customer_id=$1
-          AND status <> 'cancelled'
-          AND scheduled_date >= $2::date
-      `;
-      const countParams=[req.user.sub,start];
-      if(end){ countSql += ` AND scheduled_date <= $3::date`; countParams.push(end); }
-      const countR=await client.query(countSql,countParams);
-      const total=Number(countR.rows[0]?.count || 0);
-      const allowance=Math.max(0,Number(pr.rows[0]?.wash_credits || 0));
-      const excess=Math.max(0,total-allowance);
-
-      if(excess>0){
-        await client.query(`
-          UPDATE bookings
-          SET status='cancelled',
-              customer_notes=CASE
-                WHEN COALESCE(customer_notes,'')='' THEN 'Cancelled automatically after account plan change.'
-                ELSE customer_notes || ' Cancelled automatically after account plan change.'
-              END
-          WHERE id IN (
-            SELECT id
-            FROM bookings
-            WHERE customer_id=$1
-              AND status IN ('scheduled','assigned')
-              AND scheduled_date >= CURRENT_DATE
-            ORDER BY scheduled_date DESC, scheduled_time DESC NULLS LAST, created_at DESC
-            LIMIT $2::int
-          )
-        `,[req.user.sub,excess]);
-      }
+      let consumedSql=`SELECT count(*)::int AS count FROM bookings WHERE customer_id=$1 AND status IN ('completed','in_progress') AND scheduled_date >= $2::date`;
+      const consumedParams=[req.user.sub,start];
+      if(end){ consumedSql+=' AND scheduled_date <= $3::date'; consumedParams.push(end); }
+      const consumed=Number((await client.query(consumedSql,consumedParams)).rows[0]?.count||0);
+      const currentTotal=Number(current.carryover_exterior||0)+Number((await client.query('SELECT wash_credits FROM service_plans WHERE id=$1',[current.plan_id])).rows[0]?.wash_credits||0);
+      const carryover=Math.max(0,currentTotal-consumed);
+      const updated=(await client.query(`
+        UPDATE subscriptions
+        SET vehicle_id=$1, plan_id=$2, carryover_exterior=$3, carryover_interior=0, razorpay_subscription_id=COALESCE($4,razorpay_subscription_id)
+        WHERE id=$5 AND customer_id=$6
+        RETURNING *
+      `,[vehicle_id,plan_id,carryover,razorpay_subscription_id || null,current.id,req.user.sub])).rows[0];
 
       await client.query('COMMIT');
       return res.json(updated);
@@ -606,8 +634,8 @@ app.post('/api/subscriptions', auth, asyncRoute(async(req,res)=>{
 
     const startValue=start_date || new Date().toISOString().slice(0,10);
     const r=await client.query(`
-      INSERT INTO subscriptions(customer_id,vehicle_id,plan_id,status,start_date,end_date,razorpay_subscription_id)
-      VALUES($1,$2,$3,'active',$4,COALESCE($5::date,($4::date + INTERVAL '1 month' - INTERVAL '1 day')::date),$6)
+      INSERT INTO subscriptions(customer_id,vehicle_id,plan_id,status,start_date,end_date,razorpay_subscription_id,carryover_exterior,carryover_interior)
+      VALUES($1,$2,$3,'active',$4,COALESCE($5::date,($4::date + INTERVAL '1 month' - INTERVAL '1 day')::date),$6,0,0)
       RETURNING *
     `,[req.user.sub,vehicle_id,plan_id,startValue,end_date || null,razorpay_subscription_id || null]);
 
@@ -741,7 +769,7 @@ app.post('/api/bookings', auth, asyncRoute(async(req,res)=>{
   if(!vr.rows.length)return res.status(404).json({error:'Vehicle not found'});
 
   // Membership is account-level. One customer account has one shared wash allowance across all vehicles.
-  const subR=await q(`SELECT s.*,p.name AS plan_name,p.wash_credits FROM subscriptions s JOIN service_plans p ON p.id=s.plan_id WHERE s.customer_id=$1 AND s.status='active' ORDER BY s.created_at DESC LIMIT 1`,[req.user.sub]);
+  const subR=await q(`SELECT s.*,p.name AS plan_name,p.wash_credits,COALESCE(s.carryover_exterior,0) AS carryover_exterior FROM subscriptions s JOIN service_plans p ON p.id=s.plan_id WHERE s.customer_id=$1 AND s.status='active' ORDER BY s.created_at DESC LIMIT 1`,[req.user.sub]);
   if(!subR.rows.length)return res.status(409).json({error:'Please activate a membership plan before booking'});
   const sub=subR.rows[0];
   // A vehicle needs a 4-hour gap on BOTH sides of every booking.
@@ -784,7 +812,7 @@ app.post('/api/bookings', auth, asyncRoute(async(req,res)=>{
   `,[scheduled_date,scheduled_date,scheduled_time]);
   if(Number(staffConflict.rows[0]?.count||0)>=activeStaff)return res.status(409).json({error:'All CarCare staff are already booked around this time. Please choose an available slot.'});
   const countR=await q(`SELECT count(*)::int AS count FROM bookings WHERE customer_id=$1 AND status<>'cancelled' AND scheduled_date >= $2::date AND ($3::date IS NULL OR scheduled_date <= $3::date)`,[req.user.sub,sub.start_date,sub.end_date || null]);
-  const used=Number(countR.rows[0].count||0), allowance=Number(sub.wash_credits||0);
+  const used=Number(countR.rows[0].count||0), allowance=Number(sub.wash_credits||0)+Number(sub.carryover_exterior||0);
   if(used>=allowance)return res.status(409).json({error:`Your ${sub.plan_name} plan has used all ${allowance} exterior wash credits. Please switch to a higher plan.`});
   const r=await q(`
     INSERT INTO bookings(customer_id,vehicle_id,apartment_id,parking_bay_id,service_type,scheduled_date,scheduled_time,status,customer_notes)
