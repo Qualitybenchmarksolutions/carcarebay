@@ -33,15 +33,6 @@ const razorpay = process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET
   ? new Razorpay({ key_id: process.env.RAZORPAY_KEY_ID, key_secret: process.env.RAZORPAY_KEY_SECRET })
   : null;
 
-app.get('/api/support/config-status', auth, asyncRoute(async(req,res)=>{
-  if(!['admin'].includes(req.user.role)) return res.status(403).json({error:'Forbidden'});
-  res.json({
-    support_email: process.env.SUPPORT_EMAIL || 'support@carcarebay.com',
-    from_email: process.env.FROM_EMAIL || null,
-    transactional_email_configured: Boolean(process.env.RESEND_API_KEY && process.env.FROM_EMAIL)
-  });
-}));
-
 const q = (text, params = []) => pool.query(text, params);
 
 async function ensureAuthTable() {
@@ -102,6 +93,15 @@ const roles = (...rs) => (req, res, next) =>
   rs.includes(req.user.role) ? next() : res.status(403).json({ error: 'Forbidden' });
 
 const asyncRoute = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
+app.get('/api/support/config-status', auth, asyncRoute(async(req,res)=>{
+  if(!['admin'].includes(req.user.role)) return res.status(403).json({error:'Forbidden'});
+  res.json({
+    support_email: process.env.SUPPORT_EMAIL || 'support@carcarebay.com',
+    from_email: process.env.FROM_EMAIL || null,
+    transactional_email_configured: Boolean(process.env.RESEND_API_KEY && process.env.FROM_EMAIL)
+  });
+}));
 
 
 async function sendTransactionalEmail({to,subject,html}) {
@@ -1138,8 +1138,6 @@ app.get('/api/subscriptions/payment-link-status/:paymentId', auth, asyncRoute(as
 }));
 
 app.get('/payment-result',(req,res)=>res.type('html').send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>CarCareBay Payment</title><style>body{font-family:Arial,sans-serif;background:#f4f8fc;color:#10243a;padding:30px;text-align:center}.card{max-width:520px;margin:50px auto;background:#fff;border-radius:18px;padding:28px;box-shadow:0 8px 30px #183a5915}h1{margin-top:0}p{color:#60748a}</style></head><body><div class="card"><h1>Payment received</h1><p>Return to the CarCareBay app and tap “Check payment” to activate your membership.</p></div></body></html>`));
-// Compatibility alias: supports older Render callback configuration.
-app.get('/api/payments/callback',(req,res)=>res.redirect(302,'/payment-result'));
 
 // Legacy order endpoint retained for non-membership future services.
 app.post('/api/payments/order', auth, asyncRoute(async(req,res)=>{
