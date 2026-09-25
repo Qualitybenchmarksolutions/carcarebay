@@ -88,6 +88,14 @@ async function ensureVehicleArchiveField() {
 }
 ensureVehicleArchiveField().catch(e => console.error('vehicle archive setup failed:', e.message));
 
+async function ensureVehicleLocationFields() {
+  await q(`ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS tower_block text`);
+  await q(`ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS wing text`);
+  await q(`ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS flat_number text`);
+  await q(`ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS floor_number integer`);
+}
+ensureVehicleLocationFields().catch(e => console.error('vehicle location fields setup failed:', e.message));
+
 async function ensureApartmentLocationColumns() {
   await q(`ALTER TABLE apartments ADD COLUMN IF NOT EXISTS latitude numeric`);
   await q(`ALTER TABLE apartments ADD COLUMN IF NOT EXISTS longitude numeric`);
@@ -175,8 +183,7 @@ async function activatePaidMembership(paymentId, customerId, razorpayPaymentId=n
       return {payment:locked,subscription:existing || null,already_confirmed:true};
     }
     const plan=(await client.query('SELECT * FROM service_plans WHERE id=$1 AND active=true',[locked.plan_id])).rows[0];
-    const vehicle=(await client.query('SELECT id FROM vehicles WHERE id=$1 AND customer_id=$2',[locked.vehicle_id,customerId])).rows[0];
-    if(!plan || !vehicle) throw new Error('Plan or vehicle is no longer available');
+    if(!plan) throw new Error('Plan is no longer available');
     await client.query(`UPDATE payments SET razorpay_payment_id=COALESCE($1,razorpay_payment_id),status='paid' WHERE id=$2`,[razorpayPaymentId,paymentId]);
     const existing=(await client.query(`SELECT * FROM subscriptions WHERE customer_id=$1 AND status='active' ORDER BY created_at DESC LIMIT 1 FOR UPDATE`,[customerId])).rows[0];
     let subscription;
@@ -192,10 +199,10 @@ async function activatePaidMembership(paymentId, customerId, razorpayPaymentId=n
       // Carry forward unused credits from the old membership. Future bookings are reserved
       // against the new total, but they are not treated as already-consumed credits.
       const carryover=Math.max(0,oldTotal-consumed);
-      subscription=(await client.query(`UPDATE subscriptions SET vehicle_id=$1,plan_id=$2,carryover_exterior=$3,carryover_interior=0 WHERE id=$4 RETURNING *`,[locked.vehicle_id,locked.plan_id,carryover,existing.id])).rows[0];
+      subscription=(await client.query(`UPDATE subscriptions SET vehicle_id=NULL,plan_id=$1,carryover_exterior=$2,carryover_interior=0 WHERE id=$3 RETURNING *`,[locked.plan_id,carryover,existing.id])).rows[0];
     }else{
       const startValue=new Date().toISOString().slice(0,10);
-      subscription=(await client.query(`INSERT INTO subscriptions(customer_id,vehicle_id,plan_id,status,start_date,end_date,carryover_exterior,carryover_interior) VALUES($1,$2,$3,'active',$4,(($4::date + INTERVAL '1 month' - INTERVAL '1 day')::date),0,0) RETURNING *`,[customerId,locked.vehicle_id,locked.plan_id,startValue])).rows[0];
+      subscription=(await client.query(`INSERT INTO subscriptions(customer_id,vehicle_id,plan_id,status,start_date,end_date,carryover_exterior,carryover_interior) VALUES($1,NULL,$2,'active',$3,(($3::date + INTERVAL '1 month' - INTERVAL '1 day')::date),0,0) RETURNING *`,[customerId,locked.plan_id,startValue])).rows[0];
     }
     await client.query('UPDATE payments SET subscription_id=$1 WHERE id=$2',[subscription.id,paymentId]);
     await client.query('COMMIT');
@@ -358,7 +365,7 @@ app.get('/api/vehicles', auth, asyncRoute(async (req, res) => {
 }));
 
 app.post('/api/vehicles', auth, asyncRoute(async (req, res) => {
-  const { make, model, registration_number, color, vehicle_type, parking_bay_id } = req.body;
+  const { make, model, registration_number, color, vehicle_type, parking_bay_id, tower_block, wing, flat_number, floor_number } = req.body;
   if (!registration_number) return res.status(400).json({ error: 'registration_number is required' });
 
   if (parking_bay_id) {
@@ -372,7 +379,7 @@ app.post('/api/vehicles', auth, asyncRoute(async (req, res) => {
   const existing = await q('SELECT * FROM vehicles WHERE customer_id=$1 AND registration_number=$2 AND deleted_at IS NULL LIMIT 1',[req.user.sub, registration_number]);
   if (existing.rows.length) return res.status(409).json({ error: 'Vehicle with this registration number already exists', vehicle: existing.rows[0] });
 
-  const r = await q(`INSERT INTO vehicles(customer_id,parking_bay_id,registration_number,make,model,color,vehicle_type) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *`, [req.user.sub, parking_bay_id || null, registration_number, make || null, model || null, color || null, vehicle_type || 'car']);
+  const r = await q(`INSERT INTO vehicles(customer_id,parking_bay_id,registration_number,make,model,color,vehicle_type,tower_block,wing,flat_number,floor_number) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`, [req.user.sub, parking_bay_id || null, registration_number, make || null, model || null, color || null, vehicle_type || 'car', tower_block || null, wing || null, flat_number || null, floor_number == null || floor_number === '' ? null : Number(floor_number)]);
   if(parking_bay_id) await q(`UPDATE parking_bays SET status='occupied' WHERE id=$1`,[parking_bay_id]);
   res.status(201).json(r.rows[0]);
 }));
@@ -380,7 +387,7 @@ app.post('/api/vehicles', auth, asyncRoute(async (req, res) => {
 app.patch('/api/vehicles/:id', auth, asyncRoute(async (req, res) => {
   const current=(await q('SELECT * FROM vehicles WHERE id=$1 AND customer_id=$2 AND deleted_at IS NULL',[req.params.id,req.user.sub])).rows[0];
   if(!current) return res.status(404).json({error:'Vehicle not found'});
-  const allowed = ['make','model','registration_number','color','vehicle_type','parking_bay_id'];
+  const allowed = ['make','model','registration_number','color','vehicle_type','parking_bay_id','tower_block','wing','flat_number','floor_number'];
   const fields = allowed.filter(k => Object.prototype.hasOwnProperty.call(req.body, k));
   if (!fields.length) return res.status(400).json({ error: 'No fields to update' });
   if(req.body.registration_number){
@@ -413,15 +420,13 @@ app.delete('/api/vehicles/:id', auth, asyncRoute(async (req, res) => {
   // Ensure the archive column exists before this request. This avoids a race where
   // a freshly restarted Render instance receives a delete before startup migrations finish.
   await ensureVehicleArchiveField();
+  await ensureSubscriptionAccountLevel();
 
   const vehicleId=String(req.params.id);
   const current=(await q('SELECT * FROM vehicles WHERE id=$1 AND customer_id=$2 AND deleted_at IS NULL',[vehicleId,req.user.sub])).rows[0];
   if(!current) return res.status(404).json({error:'Vehicle not found or already deleted'});
 
-  const activeSub=await q(`SELECT id FROM subscriptions WHERE customer_id=$1 AND vehicle_id=$2 AND status='active' LIMIT 1`,[req.user.sub,vehicleId]);
-  if(activeSub.rows.length) return res.status(409).json({error:'This vehicle is linked to your active membership. Switch the membership to another vehicle before deleting it.'});
-
-  const activeBookings=await q(`SELECT id FROM bookings WHERE customer_id=$1 AND vehicle_id=$2 AND LOWER(COALESCE(status,'')) NOT IN ('completed','cancelled') LIMIT 1`,[req.user.sub,vehicleId]);
+    const activeBookings=await q(`SELECT id FROM bookings WHERE customer_id=$1 AND vehicle_id=$2 AND LOWER(COALESCE(status,'')) NOT IN ('completed','cancelled') LIMIT 1`,[req.user.sub,vehicleId]);
   if(activeBookings.rows.length) return res.status(409).json({error:'This vehicle has an upcoming or active booking. Cancel or complete that booking before deleting the vehicle.'});
 
   const client=await pool.connect();
@@ -564,25 +569,20 @@ app.get('/api/subscriptions', auth, asyncRoute(async(req,res)=>{
     SELECT s.*, p.name AS plan_name, p.monthly_price, p.wash_credits, p.interior_credits, (p.wash_credits + COALESCE(s.carryover_exterior,0)) AS total_exterior_credits, (p.interior_credits + COALESCE(s.carryover_interior,0)) AS total_interior_credits, v.registration_number
     FROM subscriptions s
     JOIN service_plans p ON p.id=s.plan_id
-    JOIN vehicles v ON v.id=s.vehicle_id
+    LEFT JOIN vehicles v ON v.id=s.vehicle_id
     WHERE s.customer_id=$1 ORDER BY s.created_at DESC
   `,[req.user.sub]);
   res.json(r.rows);
 }));
 
 app.post('/api/subscriptions', auth, asyncRoute(async(req,res)=>{
-  const {vehicle_id,plan_id,start_date,end_date,razorpay_subscription_id}=req.body || {};
-  if(!vehicle_id || !plan_id)return res.status(400).json({error:'vehicle_id and plan_id are required'});
+  const {plan_id,start_date,end_date,razorpay_subscription_id}=req.body || {};
+  if(!plan_id)return res.status(400).json({error:'plan_id is required'});
 
   const client=await pool.connect();
   try{
     await client.query('BEGIN');
 
-    const vr=await client.query('SELECT id FROM vehicles WHERE id=$1 AND customer_id=$2',[vehicle_id,req.user.sub]);
-    if(!vr.rows.length){
-      await client.query('ROLLBACK');
-      return res.status(404).json({error:'Vehicle not found'});
-    }
 
     const pr=await client.query('SELECT * FROM service_plans WHERE id=$1 AND active=true',[plan_id]);
     if(!pr.rows.length){
@@ -604,11 +604,11 @@ app.post('/api/subscriptions', auth, asyncRoute(async(req,res)=>{
       if(String(current.plan_id)===String(plan_id)){
         const updated=(await client.query(`
           UPDATE subscriptions
-          SET vehicle_id=$1,
-              razorpay_subscription_id=COALESCE($2,razorpay_subscription_id)
+          SET vehicle_id=NULL,
+              razorpay_subscription_id=COALESCE($1,razorpay_subscription_id)
           WHERE id=$3 AND customer_id=$4
           RETURNING *
-        `,[vehicle_id,razorpay_subscription_id || null,current.id,req.user.sub])).rows[0];
+        `,[razorpay_subscription_id || null,current.id,req.user.sub])).rows[0];
         await client.query('COMMIT');
         return res.json(updated);
       }
@@ -623,10 +623,10 @@ app.post('/api/subscriptions', auth, asyncRoute(async(req,res)=>{
       const carryover=Math.max(0,currentTotal-consumed);
       const updated=(await client.query(`
         UPDATE subscriptions
-        SET vehicle_id=$1, plan_id=$2, carryover_exterior=$3, carryover_interior=0, razorpay_subscription_id=COALESCE($4,razorpay_subscription_id)
+        SET vehicle_id=NULL, plan_id=$1, carryover_exterior=$2, carryover_interior=0, razorpay_subscription_id=COALESCE($3,razorpay_subscription_id)
         WHERE id=$5 AND customer_id=$6
         RETURNING *
-      `,[vehicle_id,plan_id,carryover,razorpay_subscription_id || null,current.id,req.user.sub])).rows[0];
+      `,[plan_id,carryover,razorpay_subscription_id || null,current.id,req.user.sub])).rows[0];
 
       await client.query('COMMIT');
       return res.json(updated);
@@ -635,9 +635,9 @@ app.post('/api/subscriptions', auth, asyncRoute(async(req,res)=>{
     const startValue=start_date || new Date().toISOString().slice(0,10);
     const r=await client.query(`
       INSERT INTO subscriptions(customer_id,vehicle_id,plan_id,status,start_date,end_date,razorpay_subscription_id,carryover_exterior,carryover_interior)
-      VALUES($1,$2,$3,'active',$4,COALESCE($5::date,($4::date + INTERVAL '1 month' - INTERVAL '1 day')::date),$6,0,0)
+      VALUES($1,NULL,$2,'active',$3,COALESCE($4::date,($3::date + INTERVAL '1 month' - INTERVAL '1 day')::date),$5,0,0)
       RETURNING *
-    `,[req.user.sub,vehicle_id,plan_id,startValue,end_date || null,razorpay_subscription_id || null]);
+    `,[req.user.sub,plan_id,startValue,end_date || null,razorpay_subscription_id || null]);
 
     await client.query('COMMIT');
     return res.status(201).json(r.rows[0]);
@@ -986,15 +986,14 @@ app.get('/api/payments', auth, asyncRoute(async(req,res)=>{
 // Creates a server-side Razorpay Order for a membership purchase/switch.
 // The amount is always read from the server-side service plan, never trusted from the app.
 app.post('/api/subscriptions/checkout', auth, asyncRoute(async(req,res)=>{
-  const {vehicle_id,plan_id}=req.body || {};
-  if(!vehicle_id || !plan_id) return res.status(400).json({error:'vehicle_id and plan_id are required'});
+  const {plan_id}=req.body || {};
+  if(!plan_id) return res.status(400).json({error:'plan_id is required'});
   if(!razorpay) return res.status(503).json({error:'Razorpay is not configured. Add RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET in Render.'});
 
   const [vr,pr]=await Promise.all([
     q('SELECT id,make,model,registration_number FROM vehicles WHERE id=$1 AND customer_id=$2',[vehicle_id,req.user.sub]),
     q('SELECT id,name,monthly_price,active FROM service_plans WHERE id=$1',[plan_id])
   ]);
-  if(!vr.rows.length) return res.status(404).json({error:'Vehicle not found'});
   if(!pr.rows.length || !pr.rows[0].active) return res.status(404).json({error:'Plan not found'});
 
   const amount=Number(pr.rows[0].monthly_price);
@@ -1004,11 +1003,11 @@ app.post('/api/subscriptions/checkout', auth, asyncRoute(async(req,res)=>{
     amount:Math.round(amount*100),
     currency:'INR',
     receipt:`ccb_${Date.now()}_${String(req.user.sub).slice(0,8)}`,
-    notes:{customer_id:req.user.sub,vehicle_id,plan_id}
+    notes:{customer_id:req.user.sub,plan_id}
   });
 
   const r=await q(`INSERT INTO payments(customer_id,subscription_id,booking_id,plan_id,vehicle_id,amount,gateway_order_amount,currency,status,payment_method,razorpay_order_id)
-    VALUES($1,NULL,NULL,$2,$3,$4,$5,'INR','created','razorpay',$6) RETURNING *`,
+    VALUES($1,NULL,NULL,$2,NULL,$3,$4,'INR','created','razorpay',$5) RETURNING *`,
     [req.user.sub,plan_id,vehicle_id,amount,order.amount,order.id]);
 
   res.status(201).json({
@@ -1062,15 +1061,14 @@ app.post('/api/subscriptions/confirm-payment', auth, asyncRoute(async(req,res)=>
     }
 
     const plan=(await client.query('SELECT * FROM service_plans WHERE id=$1 AND active=true',[locked.plan_id])).rows[0];
-    const vehicle=(await client.query('SELECT id FROM vehicles WHERE id=$1 AND customer_id=$2',[locked.vehicle_id,req.user.sub])).rows[0];
-    if(!plan || !vehicle) throw new Error('Plan or vehicle is no longer available');
+    if(!plan) throw new Error('Plan is no longer available');
 
     await client.query(`UPDATE payments SET razorpay_payment_id=$1,status='paid' WHERE id=$2`,[razorpay_payment_id,payment_id]);
 
     const existing=(await client.query(`SELECT * FROM subscriptions WHERE customer_id=$1 AND status='active' ORDER BY created_at DESC LIMIT 1 FOR UPDATE`,[req.user.sub])).rows[0];
     let subscription;
     if(existing){
-      subscription=(await client.query(`UPDATE subscriptions SET vehicle_id=$1,plan_id=$2 WHERE id=$3 RETURNING *`,[locked.vehicle_id,locked.plan_id,existing.id])).rows[0];
+      subscription=(await client.query(`UPDATE subscriptions SET vehicle_id=NULL,plan_id=$1 WHERE id=$2 RETURNING *`,[locked.plan_id,existing.id])).rows[0];
 
       const start=String(existing.start_date || new Date().toISOString().slice(0,10)).slice(0,10);
       const end=existing.end_date ? String(existing.end_date).slice(0,10) : null;
@@ -1086,7 +1084,7 @@ app.post('/api/subscriptions/confirm-payment', auth, asyncRoute(async(req,res)=>
       }
     }else{
       const startValue=new Date().toISOString().slice(0,10);
-      subscription=(await client.query(`INSERT INTO subscriptions(customer_id,vehicle_id,plan_id,status,start_date,end_date) VALUES($1,$2,$3,'active',$4,(($4::date + INTERVAL '1 month' - INTERVAL '1 day')::date)) RETURNING *`,[req.user.sub,locked.vehicle_id,locked.plan_id,startValue])).rows[0];
+      subscription=(await client.query(`INSERT INTO subscriptions(customer_id,vehicle_id,plan_id,status,start_date,end_date) VALUES($1,NULL,$2,'active',$3,(($3::date + INTERVAL '1 month' - INTERVAL '1 day')::date)) RETURNING *`,[req.user.sub,locked.plan_id,startValue])).rows[0];
     }
 
     await client.query('UPDATE payments SET subscription_id=$1 WHERE id=$2',[subscription.id,payment_id]);
@@ -1129,15 +1127,13 @@ app.post('/api/payments/webhook', asyncRoute(async(req,res)=>{
 
 // Expo Go-friendly membership checkout using a hosted Razorpay Payment Link.
 app.post('/api/subscriptions/payment-link', auth, asyncRoute(async(req,res)=>{
-  const {vehicle_id,plan_id}=req.body || {};
-  if(!vehicle_id || !plan_id) return res.status(400).json({error:'vehicle_id and plan_id are required'});
+  const {plan_id}=req.body || {};
+  if(!plan_id) return res.status(400).json({error:'plan_id is required'});
   if(!razorpay) return res.status(503).json({error:'Razorpay is not configured. Add RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET in Render.'});
   const [vr,pr,cr]=await Promise.all([
-    q('SELECT id,make,model,registration_number FROM vehicles WHERE id=$1 AND customer_id=$2',[vehicle_id,req.user.sub]),
     q('SELECT id,name,monthly_price,active FROM service_plans WHERE id=$1',[plan_id]),
     q('SELECT id,full_name,email,phone FROM customers WHERE id=$1',[req.user.sub])
   ]);
-  if(!vr.rows.length) return res.status(404).json({error:'Vehicle not found'});
   if(!pr.rows.length || !pr.rows[0].active) return res.status(404).json({error:'Plan not found'});
   const customer=cr.rows[0];
   const amount=Number(pr.rows[0].monthly_price);
@@ -1150,13 +1146,13 @@ app.post('/api/subscriptions/payment-link', auth, asyncRoute(async(req,res)=>{
     description:`CarCareBay ${pr.rows[0].name} membership`,
     customer:{name:customer?.full_name || req.user.name || 'CarCareBay customer',contact:customer?.phone || req.user.phone || undefined,email:customer?.email || undefined},
     notify:{email:false,sms:false},reminder_enable:false,callback_url:callbackUrl,callback_method:'get',
-    notes:{customer_id:String(req.user.sub),vehicle_id:String(vehicle_id),plan_id:String(plan_id),reference_id:reference}
+    notes:{customer_id:String(req.user.sub),plan_id:String(plan_id),reference_id:reference}
   })});
   const link=await response.json().catch(()=>({}));
   if(!response.ok) return res.status(response.status).json({error:link?.error?.description || link?.error?.message || 'Could not create Razorpay payment link'});
   const payment=(await q(`INSERT INTO payments(customer_id,subscription_id,booking_id,plan_id,vehicle_id,amount,gateway_order_amount,currency,status,payment_method,razorpay_payment_link_id)
-    VALUES($1,NULL,NULL,$2,$3,$4,$5,'INR','created','razorpay_payment_link',$6) RETURNING *`,[req.user.sub,plan_id,vehicle_id,amount,link.amount,link.id])).rows[0];
-  res.status(201).json({payment,payment_link:{id:link.id,short_url:link.short_url,status:link.status,amount:link.amount},plan:pr.rows[0],vehicle:vr.rows[0]});
+    VALUES($1,NULL,NULL,$2,NULL,$3,$4,'INR','created','razorpay_payment_link',$5) RETURNING *`,[req.user.sub,plan_id,amount,link.amount,link.id])).rows[0];
+  res.status(201).json({payment,payment_link:{id:link.id,short_url:link.short_url,status:link.status,amount:link.amount},plan:pr.rows[0]});
 }));
 
 app.get('/api/subscriptions/payment-link-status/:paymentId', auth, asyncRoute(async(req,res)=>{
