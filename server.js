@@ -13,6 +13,19 @@ import multer from 'multer';
 const app = express();
 const PORT = process.env.PORT || 4000;
 
+// Normalize PostgreSQL DATE values (pg commonly returns them as JS Date objects)
+// to YYYY-MM-DD before sending them back into ::date parameters.
+function dateOnly(value, fallback=null){
+  if(value == null || value === '') return fallback;
+  if(value instanceof Date) return value.toISOString().slice(0,10);
+  const s=String(value);
+  const m=s.match(/^(\d{4}-\d{2}-\d{2})/);
+  if(m) return m[1];
+  const d=new Date(s);
+  return Number.isNaN(d.getTime()) ? fallback : d.toISOString().slice(0,10);
+}
+
+
 if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required');
 if (!process.env.JWT_SECRET) throw new Error('JWT_SECRET is required');
 
@@ -158,8 +171,8 @@ async function activatePaidMembership(paymentId, customerId, razorpayPaymentId=n
     let subscription;
     if(existing){
       subscription=(await client.query(`UPDATE subscriptions SET vehicle_id=$1,plan_id=$2 WHERE id=$3 RETURNING *`,[locked.vehicle_id,locked.plan_id,existing.id])).rows[0];
-      const start=String(existing.start_date || new Date().toISOString().slice(0,10)).slice(0,10);
-      const end=existing.end_date ? String(existing.end_date).slice(0,10) : null;
+      const start=dateOnly(existing.start_date,new Date().toISOString().slice(0,10));
+      const end=dateOnly(existing.end_date,null);
       let countSql=`SELECT count(*)::int AS count FROM bookings WHERE customer_id=$1 AND status <> 'cancelled' AND scheduled_date >= $2::date`;
       const countParams=[customerId,start];
       if(end){countSql+=' AND scheduled_date <= $3::date';countParams.push(end);}
@@ -551,8 +564,8 @@ app.post('/api/subscriptions', auth, asyncRoute(async(req,res)=>{
       // Keep already completed work as consumed credits. If the new plan has fewer
       // credits than the account has used/booked, cancel only the latest future
       // scheduled/assigned bookings until the account is within its allowance.
-      const start=String(current.start_date || start_date || new Date().toISOString().slice(0,10)).slice(0,10);
-      const end=current.end_date ? String(current.end_date).slice(0,10) : null;
+      const start=dateOnly(current.start_date,start_date || new Date().toISOString().slice(0,10));
+      const end=dateOnly(current.end_date,null);
       let countSql=`
         SELECT count(*)::int AS count
         FROM bookings
