@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import express from 'express';
+import crypto from 'crypto';
 import cors from 'cors';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
@@ -22,7 +23,7 @@ const pool = new Pool({
 
 const origins = (process.env.CORS_ORIGINS || '*').split(',').map(s => s.trim());
 app.use(cors({ origin: (o, cb) => cb(null, !o || origins.includes('*') || origins.includes(o)) }));
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '10mb', verify: (req, res, buf) => { req.rawBody = Buffer.from(buf); } }));
 
 const uploadDir = path.resolve(process.env.STORAGE_DIR || './uploads');
 fs.mkdirSync(uploadDir, { recursive: true });
@@ -31,6 +32,15 @@ const upload = multer({ dest: uploadDir });
 const razorpay = process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET
   ? new Razorpay({ key_id: process.env.RAZORPAY_KEY_ID, key_secret: process.env.RAZORPAY_KEY_SECRET })
   : null;
+
+app.get('/api/support/config-status', auth, asyncRoute(async(req,res)=>{
+  if(!['admin'].includes(req.user.role)) return res.status(403).json({error:'Forbidden'});
+  res.json({
+    support_email: process.env.SUPPORT_EMAIL || 'support@carcarebay.com',
+    from_email: process.env.FROM_EMAIL || null,
+    transactional_email_configured: Boolean(process.env.RESEND_API_KEY && process.env.FROM_EMAIL)
+  });
+}));
 
 const q = (text, params = []) => pool.query(text, params);
 
@@ -54,6 +64,14 @@ async function ensureProfileFields() {
   await q(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS profile_quote text`);
 }
 ensureProfileFields().catch(e => console.error('profile fields setup failed:', e.message));
+
+async function ensurePaymentFields() {
+  await q(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS plan_id uuid`);
+  await q(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS vehicle_id uuid`);
+  await q(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS gateway_order_amount numeric`);
+  await q(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS razorpay_payment_link_id text`);
+}
+ensurePaymentFields().catch(e => console.error('payment fields setup failed:', e.message));
 
 async function ensureApartmentLocationColumns() {
   await q(`ALTER TABLE apartments ADD COLUMN IF NOT EXISTS latitude numeric`);
@@ -84,6 +102,81 @@ const roles = (...rs) => (req, res, next) =>
   rs.includes(req.user.role) ? next() : res.status(403).json({ error: 'Forbidden' });
 
 const asyncRoute = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
+
+async function sendTransactionalEmail({to,subject,html}) {
+  if(!process.env.RESEND_API_KEY || !process.env.FROM_EMAIL || !to) return {sent:false,reason:'email_not_configured'};
+  const response=await fetch('https://api.resend.com/emails',{
+    method:'POST',
+    headers:{'Authorization':`Bearer ${process.env.RESEND_API_KEY}`,'Content-Type':'application/json'},
+    body:JSON.stringify({from:process.env.FROM_EMAIL,to:[to],subject,html})
+  });
+  const data=await response.json().catch(()=>({}));
+  if(!response.ok) throw new Error(data?.message || data?.error?.message || `Email failed (${response.status})`);
+  return {sent:true,id:data?.id || null};
+}
+
+function emailShell(title,body){
+  return `<!doctype html><html><body style="margin:0;background:#f4f8fc;font-family:Arial,sans-serif;color:#10243a"><div style="max-width:620px;margin:24px auto;background:#fff;border:1px solid #d8e5f0;border-radius:18px;overflow:hidden"><div style="background:#0f2942;padding:24px;color:#fff"><div style="font-size:22px;font-weight:800">CarCareBay</div><div style="opacity:.8;margin-top:4px">DRIVE CLEANER LIVE HAPPIER</div></div><div style="padding:28px"><h2 style="margin-top:0">${title}</h2>${body}</div><div style="padding:18px 28px;background:#f4f8fc;color:#60748a;font-size:12px">CarCareBay Support · ${process.env.SUPPORT_EMAIL || 'support@carcarebay.com'}</div></div></body></html>`;
+}
+
+async function sendBookingConfirmation(bookingId){
+  try{
+    const r=await q(`SELECT b.*,c.full_name,c.email,v.make,v.model,v.registration_number,a.name AS apartment_name
+      FROM bookings b JOIN customers c ON c.id=b.customer_id JOIN vehicles v ON v.id=b.vehicle_id
+      LEFT JOIN apartments a ON a.id=b.apartment_id WHERE b.id=$1`,[bookingId]);
+    const b=r.rows[0]; if(!b?.email) return;
+    await sendTransactionalEmail({to:b.email,subject:`CarCareBay booking confirmed · ${String(b.scheduled_date).slice(0,10)}`,html:emailShell('Your wash is booked',`<p>Hi ${b.full_name || 'there'},</p><p>Your CarCareBay service has been scheduled.</p><p><strong>${b.make || ''} ${b.model || ''}</strong> · ${b.registration_number || ''}<br>${String(b.scheduled_date).slice(0,10)} at ${String(b.scheduled_time || '').slice(0,5)}<br>${b.apartment_name || 'Your parking bay'}</p><p>We’ll keep the booking status updated in the app.</p>`) });
+  }catch(e){ console.error('booking confirmation email failed:',e.message); }
+}
+
+async function sendMembershipConfirmation(paymentId){
+  try{
+    const r=await q(`SELECT p.*,c.full_name,c.email,sp.name AS plan_name,v.make,v.model,v.registration_number
+      FROM payments p JOIN customers c ON c.id=p.customer_id LEFT JOIN service_plans sp ON sp.id=p.plan_id LEFT JOIN vehicles v ON v.id=p.vehicle_id WHERE p.id=$1`,[paymentId]);
+    const p=r.rows[0]; if(!p?.email) return;
+    await sendTransactionalEmail({to:p.email,subject:`CarCareBay membership active · ${p.plan_name || 'Plan'}`,html:emailShell('Membership activated',`<p>Hi ${p.full_name || 'there'},</p><p>Your CarCareBay membership payment was successful and your membership is now active.</p><p><strong>${p.plan_name || 'CarCareBay plan'}</strong> · ₹${Number(p.amount || 0).toFixed(2)}/month<br>Vehicle: ${p.make || ''} ${p.model || ''} · ${p.registration_number || ''}</p><p>You can now book your included services from the CarCareBay app.</p>`) });
+  }catch(e){ console.error('membership email failed:',e.message); }
+}
+
+async function activatePaidMembership(paymentId, customerId, razorpayPaymentId=null){
+  const client=await pool.connect();
+  try{
+    await client.query('BEGIN');
+    const locked=(await client.query(`SELECT * FROM payments WHERE id=$1 AND customer_id=$2 FOR UPDATE`,[paymentId,customerId])).rows[0];
+    if(!locked) throw new Error('Payment not found');
+    if(String(locked.status)==='paid'){
+      const existing=(await client.query(`SELECT * FROM subscriptions WHERE customer_id=$1 AND status='active' ORDER BY created_at DESC LIMIT 1`,[customerId])).rows[0];
+      await client.query('COMMIT');
+      return {payment:locked,subscription:existing || null,already_confirmed:true};
+    }
+    const plan=(await client.query('SELECT * FROM service_plans WHERE id=$1 AND active=true',[locked.plan_id])).rows[0];
+    const vehicle=(await client.query('SELECT id FROM vehicles WHERE id=$1 AND customer_id=$2',[locked.vehicle_id,customerId])).rows[0];
+    if(!plan || !vehicle) throw new Error('Plan or vehicle is no longer available');
+    await client.query(`UPDATE payments SET razorpay_payment_id=COALESCE($1,razorpay_payment_id),status='paid' WHERE id=$2`,[razorpayPaymentId,paymentId]);
+    const existing=(await client.query(`SELECT * FROM subscriptions WHERE customer_id=$1 AND status='active' ORDER BY created_at DESC LIMIT 1 FOR UPDATE`,[customerId])).rows[0];
+    let subscription;
+    if(existing){
+      subscription=(await client.query(`UPDATE subscriptions SET vehicle_id=$1,plan_id=$2 WHERE id=$3 RETURNING *`,[locked.vehicle_id,locked.plan_id,existing.id])).rows[0];
+      const start=String(existing.start_date || new Date().toISOString().slice(0,10)).slice(0,10);
+      const end=existing.end_date ? String(existing.end_date).slice(0,10) : null;
+      let countSql=`SELECT count(*)::int AS count FROM bookings WHERE customer_id=$1 AND status <> 'cancelled' AND scheduled_date >= $2::date`;
+      const countParams=[customerId,start];
+      if(end){countSql+=' AND scheduled_date <= $3::date';countParams.push(end);}
+      const total=Number((await client.query(countSql,countParams)).rows[0]?.count||0);
+      const allowance=Math.max(0,Number(plan.wash_credits||0));
+      const excess=Math.max(0,total-allowance);
+      if(excess>0) await client.query(`UPDATE bookings SET status='cancelled',customer_notes=CASE WHEN COALESCE(customer_notes,'')='' THEN 'Cancelled automatically after account plan change.' ELSE customer_notes || ' Cancelled automatically after account plan change.' END WHERE id IN (SELECT id FROM bookings WHERE customer_id=$1 AND status IN ('scheduled','assigned') AND scheduled_date >= CURRENT_DATE ORDER BY scheduled_date DESC, scheduled_time DESC NULLS LAST, created_at DESC LIMIT $2::int)`,[customerId,excess]);
+    }else{
+      const startValue=new Date().toISOString().slice(0,10);
+      subscription=(await client.query(`INSERT INTO subscriptions(customer_id,vehicle_id,plan_id,status,start_date,end_date) VALUES($1,$2,$3,'active',$4,(($4::date + INTERVAL '1 month' - INTERVAL '1 day')::date)) RETURNING *`,[customerId,locked.vehicle_id,locked.plan_id,startValue])).rows[0];
+    }
+    await client.query('UPDATE payments SET subscription_id=$1 WHERE id=$2',[subscription.id,paymentId]);
+    await client.query('COMMIT');
+    sendMembershipConfirmation(paymentId);
+    return {payment:{...locked,status:'paid',razorpay_payment_id:razorpayPaymentId || locked.razorpay_payment_id},subscription};
+  }catch(err){try{await client.query('ROLLBACK')}catch{};throw err;}finally{client.release();}
+}
 
 app.get('/health', asyncRoute(async (_, res) => {
   await q('SELECT 1');
@@ -404,43 +497,115 @@ app.get('/api/subscriptions', auth, asyncRoute(async(req,res)=>{
 }));
 
 app.post('/api/subscriptions', auth, asyncRoute(async(req,res)=>{
-  const {vehicle_id,plan_id,start_date,end_date,razorpay_subscription_id}=req.body;
+  const {vehicle_id,plan_id,start_date,end_date,razorpay_subscription_id}=req.body || {};
   if(!vehicle_id || !plan_id)return res.status(400).json({error:'vehicle_id and plan_id are required'});
-  const vr=await q('SELECT id FROM vehicles WHERE id=$1 AND customer_id=$2',[vehicle_id,req.user.sub]);
-  if(!vr.rows.length)return res.status(404).json({error:'Vehicle not found'});
-  const pr=await q('SELECT * FROM service_plans WHERE id=$1 AND active=true',[plan_id]);
-  if(!pr.rows.length)return res.status(404).json({error:'Plan not found'});
 
-  // A membership is paid for once at the account level and its wash credits are shared
-  // across every vehicle belonging to that customer. The selected vehicle is retained
-  // only as the subscription's anchor vehicle for compatibility with the existing schema.
-  const existing=await q(`SELECT * FROM subscriptions WHERE customer_id=$1 AND status='active' ORDER BY created_at DESC LIMIT 1`,[req.user.sub]);
-  if(existing.rows.length){
-    const current=existing.rows[0];
-    if(String(current.plan_id)===String(plan_id)){
-      const updated=(await q(`UPDATE subscriptions SET vehicle_id=$1, razorpay_subscription_id=COALESCE($2,razorpay_subscription_id) WHERE id=$3 RETURNING *`,[vehicle_id,razorpay_subscription_id || null,current.id])).rows[0];
+  const client=await pool.connect();
+  try{
+    await client.query('BEGIN');
+
+    const vr=await client.query('SELECT id FROM vehicles WHERE id=$1 AND customer_id=$2',[vehicle_id,req.user.sub]);
+    if(!vr.rows.length){
+      await client.query('ROLLBACK');
+      return res.status(404).json({error:'Vehicle not found'});
+    }
+
+    const pr=await client.query('SELECT * FROM service_plans WHERE id=$1 AND active=true',[plan_id]);
+    if(!pr.rows.length){
+      await client.query('ROLLBACK');
+      return res.status(404).json({error:'Plan not found'});
+    }
+
+    // Membership is account-level. The selected vehicle is only the subscription anchor.
+    const existing=await client.query(`
+      SELECT * FROM subscriptions
+      WHERE customer_id=$1 AND status='active'
+      ORDER BY created_at DESC LIMIT 1
+      FOR UPDATE
+    `,[req.user.sub]);
+
+    if(existing.rows.length){
+      const current=existing.rows[0];
+
+      if(String(current.plan_id)===String(plan_id)){
+        const updated=(await client.query(`
+          UPDATE subscriptions
+          SET vehicle_id=$1,
+              razorpay_subscription_id=COALESCE($2,razorpay_subscription_id)
+          WHERE id=$3 AND customer_id=$4
+          RETURNING *
+        `,[vehicle_id,razorpay_subscription_id || null,current.id,req.user.sub])).rows[0];
+        await client.query('COMMIT');
+        return res.json(updated);
+      }
+
+      const updated=(await client.query(`
+        UPDATE subscriptions
+        SET vehicle_id=$1,
+            plan_id=$2,
+            razorpay_subscription_id=COALESCE($3,razorpay_subscription_id)
+        WHERE id=$4 AND customer_id=$5
+        RETURNING *
+      `,[vehicle_id,plan_id,razorpay_subscription_id || null,current.id,req.user.sub])).rows[0];
+
+      // Keep already completed work as consumed credits. If the new plan has fewer
+      // credits than the account has used/booked, cancel only the latest future
+      // scheduled/assigned bookings until the account is within its allowance.
+      const start=String(current.start_date || start_date || new Date().toISOString().slice(0,10)).slice(0,10);
+      const end=current.end_date ? String(current.end_date).slice(0,10) : null;
+      let countSql=`
+        SELECT count(*)::int AS count
+        FROM bookings
+        WHERE customer_id=$1
+          AND status <> 'cancelled'
+          AND scheduled_date >= $2::date
+      `;
+      const countParams=[req.user.sub,start];
+      if(end){ countSql += ` AND scheduled_date <= $3::date`; countParams.push(end); }
+      const countR=await client.query(countSql,countParams);
+      const total=Number(countR.rows[0]?.count || 0);
+      const allowance=Math.max(0,Number(pr.rows[0]?.wash_credits || 0));
+      const excess=Math.max(0,total-allowance);
+
+      if(excess>0){
+        await client.query(`
+          UPDATE bookings
+          SET status='cancelled',
+              customer_notes=CASE
+                WHEN COALESCE(customer_notes,'')='' THEN 'Cancelled automatically after account plan change.'
+                ELSE customer_notes || ' Cancelled automatically after account plan change.'
+              END
+          WHERE id IN (
+            SELECT id
+            FROM bookings
+            WHERE customer_id=$1
+              AND status IN ('scheduled','assigned')
+              AND scheduled_date >= CURRENT_DATE
+            ORDER BY scheduled_date DESC, scheduled_time DESC NULLS LAST, created_at DESC
+            LIMIT $2::int
+          )
+        `,[req.user.sub,excess]);
+      }
+
+      await client.query('COMMIT');
       return res.json(updated);
     }
-    const updated=(await q(`UPDATE subscriptions SET vehicle_id=$1, plan_id=$2, razorpay_subscription_id=COALESCE($3,razorpay_subscription_id) WHERE id=$4 RETURNING *`,[vehicle_id,plan_id,razorpay_subscription_id || null,current.id])).rows[0];
 
-    const start=String(current.start_date || new Date().toISOString().slice(0,10)).slice(0,10);
-    const end=current.end_date ? String(current.end_date).slice(0,10) : null;
-    const countR=await q(`SELECT count(*)::int AS count FROM bookings WHERE customer_id=$1 AND status<>'cancelled' AND scheduled_date >= $2::date AND ($3::date IS NULL OR scheduled_date <= $3::date)`,[req.user.sub,start,end]);
-    const total=Number(countR.rows[0].count||0), allowance=Number(pr.rows[0].wash_credits||0), excess=Math.max(0,total-allowance);
-    if(excess>0){
-      await q(`UPDATE bookings SET status='cancelled', customer_notes=COALESCE(customer_notes,'') || CASE WHEN COALESCE(customer_notes,'')='' THEN 'Cancelled automatically after account plan change.' ELSE ' Cancelled automatically after account plan change.' END WHERE id IN (
-        SELECT id FROM bookings WHERE customer_id=$1 AND status IN ('scheduled','assigned') AND scheduled_date >= CURRENT_DATE ORDER BY scheduled_date DESC, scheduled_time DESC, created_at DESC LIMIT $2
-      )`,[req.user.sub,excess]);
-    }
-    return res.json(updated);
+    const startValue=start_date || new Date().toISOString().slice(0,10);
+    const r=await client.query(`
+      INSERT INTO subscriptions(customer_id,vehicle_id,plan_id,status,start_date,end_date,razorpay_subscription_id)
+      VALUES($1,$2,$3,'active',$4,COALESCE($5::date,($4::date + INTERVAL '1 month' - INTERVAL '1 day')::date),$6)
+      RETURNING *
+    `,[req.user.sub,vehicle_id,plan_id,startValue,end_date || null,razorpay_subscription_id || null]);
+
+    await client.query('COMMIT');
+    return res.status(201).json(r.rows[0]);
+  }catch(err){
+    try{await client.query('ROLLBACK')}catch{}
+    throw err;
+  }finally{
+    client.release();
   }
-
-  const startValue=start_date || new Date().toISOString().slice(0,10);
-  const r=await q(`
-    INSERT INTO subscriptions(customer_id,vehicle_id,plan_id,status,start_date,end_date,razorpay_subscription_id)
-    VALUES($1,$2,$3,'active',$4,COALESCE($5::date,($4::date + INTERVAL '1 month' - INTERVAL '1 day')::date),$6) RETURNING *
-  `,[req.user.sub,vehicle_id,plan_id,startValue,end_date || null,razorpay_subscription_id || null]);
-  res.status(201).json(r.rows[0]);
 }));
 
 app.patch('/api/subscriptions/:id', auth, asyncRoute(async(req,res)=>{
@@ -548,7 +713,9 @@ app.get('/api/availability', auth, asyncRoute(async(req,res)=>{
     if(available && sameSlot){available=false;reason='already_booked';}
     if(available && activeStaff<=0){available=false;reason='staff_unavailable';}
     if(available && overlappingStaff>=activeStaff){available=false;reason='staff_unavailable';}
-    if(available && vehicleBookings.some(startMs=>candidateMs>startMs && candidateMs<startMs+4*60*60*1000)){available=false;reason='vehicle_window';}
+    // Block slots within 4 hours BEFORE or AFTER an existing booking for this vehicle.
+    // Exactly 4 hours apart remains allowed.
+    if(available && vehicleBookings.some(startMs=>Math.abs(candidateMs-startMs)<4*60*60*1000)){available=false;reason='vehicle_window';}
     slots.push({time,label:new Date(2000,0,1,hour,0).toLocaleTimeString('en-IN',{hour:'numeric',minute:'2-digit'}),available,reason});
   }
   res.json({date,active_staff:activeStaff,service_minutes:serviceMinutes,operating_hours:{open:`${String(openingHour).padStart(2,'0')}:00`,close:`${String(closingHour).padStart(2,'0')}:00`},slots});
@@ -564,25 +731,24 @@ app.post('/api/bookings', auth, asyncRoute(async(req,res)=>{
   const subR=await q(`SELECT s.*,p.name AS plan_name,p.wash_credits FROM subscriptions s JOIN service_plans p ON p.id=s.plan_id WHERE s.customer_id=$1 AND s.status='active' ORDER BY s.created_at DESC LIMIT 1`,[req.user.sub]);
   if(!subR.rows.length)return res.status(409).json({error:'Please activate a membership plan before booking'});
   const sub=subR.rows[0];
-  // A vehicle needs a 4-hour service window before its NEXT booking.
-  // Important: this is forward-looking only. An existing booking at 10:00 AM
-  // blocks 10:00 AM through 1:59 PM, but it does NOT block an earlier booking
-  // such as 8:00 AM. This keeps past/earlier times independent of a later job.
+  // A vehicle needs a 4-hour gap on BOTH sides of every booking.
+  // Example: an 11:00 AM booking blocks 7:00 AM through 2:59 PM.
+  // Exactly 4 hours apart (e.g. 7:00 AM and 11:00 AM) is allowed.
   const candidateTs = `($2::date + $3::time)`;
   const existingSlot=await q(`
-    SELECT id, scheduled_date, scheduled_time
+    SELECT id, scheduled_date, scheduled_time,
+           extract(epoch FROM (${candidateTs} - (scheduled_date + scheduled_time))) / 3600.0 AS hour_gap
     FROM bookings
     WHERE customer_id=$1
       AND vehicle_id=$4
       AND status<>'cancelled'
-      AND (scheduled_date + scheduled_time) <= ${candidateTs}
-      AND (scheduled_date + scheduled_time) + interval '4 hours' > ${candidateTs}
-    ORDER BY scheduled_date DESC, scheduled_time DESC
+      AND abs(extract(epoch FROM (${candidateTs} - (scheduled_date + scheduled_time)))) < 4 * 3600
+    ORDER BY abs(extract(epoch FROM (${candidateTs} - (scheduled_date + scheduled_time)))) ASC
     LIMIT 1
   `,[req.user.sub,scheduled_date,scheduled_time,vehicle_id]);
   if(existingSlot.rows.length){
     const b=existingSlot.rows[0];
-    return res.status(409).json({error:`This vehicle already has a booking at ${String(b.scheduled_time).slice(0,5)} on ${String(b.scheduled_date).slice(0,10)}. The next booking for this vehicle must be at least 4 hours later.`});
+    return res.status(409).json({error:`This vehicle already has a booking at ${String(b.scheduled_time).slice(0,5)} on ${String(b.scheduled_date).slice(0,10)}. Another booking must be at least 4 hours before or after it.`});
   }
   const maxBookingDate = new Date();
   maxBookingDate.setHours(0,0,0,0);
@@ -611,6 +777,7 @@ app.post('/api/bookings', auth, asyncRoute(async(req,res)=>{
     INSERT INTO bookings(customer_id,vehicle_id,apartment_id,parking_bay_id,service_type,scheduled_date,scheduled_time,status,customer_notes)
     VALUES($1,$2,$3,$4,$5,$6,$7,'scheduled',$8) RETURNING *
   `,[req.user.sub,vehicle_id,apartment_id || null,parking_bay_id || vr.rows[0].parking_bay_id || null,service_type,scheduled_date,scheduled_time,customer_notes || null]);
+  sendBookingConfirmation(r.rows[0].id);
   res.status(201).json(r.rows[0]);
 }));
 
@@ -625,23 +792,23 @@ app.patch('/api/bookings/:id', auth, asyncRoute(async(req,res)=>{
   if(req.user.role==='customer' && (Object.hasOwn(req.body,'scheduled_date') || Object.hasOwn(req.body,'scheduled_time') || Object.hasOwn(req.body,'vehicle_id'))){
     const newDate=req.body.scheduled_date || existing.scheduled_date;
     const newTime=req.body.scheduled_time || existing.scheduled_time;
-    // Apply the same forward-only 4-hour rule when modifying a booking.
+    // Apply the same 4-hour gap rule in BOTH directions when modifying a booking.
     const candidateTs = `($2::date + $3::time)`;
     const conflict=await q(`
-      SELECT id, scheduled_date, scheduled_time
+      SELECT id, scheduled_date, scheduled_time,
+             extract(epoch FROM (${candidateTs} - (scheduled_date + scheduled_time))) / 3600.0 AS hour_gap
       FROM bookings
       WHERE customer_id=$1
         AND vehicle_id=$4
         AND status<>'cancelled'
         AND id<>$5
-        AND (scheduled_date + scheduled_time) <= ${candidateTs}
-        AND (scheduled_date + scheduled_time) + interval '4 hours' > ${candidateTs}
-      ORDER BY scheduled_date DESC, scheduled_time DESC
+        AND abs(extract(epoch FROM (${candidateTs} - (scheduled_date + scheduled_time)))) < 4 * 3600
+      ORDER BY abs(extract(epoch FROM (${candidateTs} - (scheduled_date + scheduled_time)))) ASC
       LIMIT 1
     `,[req.user.sub,newDate,newTime,req.body.vehicle_id || existing.vehicle_id,req.params.id]);
     if(conflict.rows.length){
       const b=conflict.rows[0];
-      return res.status(409).json({error:`This vehicle already has a booking at ${String(b.scheduled_time).slice(0,5)} on ${String(b.scheduled_date).slice(0,10)}. The next booking for this vehicle must be at least 4 hours later.`});
+      return res.status(409).json({error:`This vehicle already has a booking at ${String(b.scheduled_time).slice(0,5)} on ${String(b.scheduled_date).slice(0,10)}. Another booking must be at least 4 hours before or after it.`});
     }
         const maxBookingDate = new Date();
     maxBookingDate.setHours(0,0,0,0);
@@ -775,24 +942,230 @@ app.get('/api/payments', auth, asyncRoute(async(req,res)=>{
   res.json(r.rows);
 }));
 
+// Creates a server-side Razorpay Order for a membership purchase/switch.
+// The amount is always read from the server-side service plan, never trusted from the app.
+app.post('/api/subscriptions/checkout', auth, asyncRoute(async(req,res)=>{
+  const {vehicle_id,plan_id}=req.body || {};
+  if(!vehicle_id || !plan_id) return res.status(400).json({error:'vehicle_id and plan_id are required'});
+  if(!razorpay) return res.status(503).json({error:'Razorpay is not configured. Add RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET in Render.'});
+
+  const [vr,pr]=await Promise.all([
+    q('SELECT id,make,model,registration_number FROM vehicles WHERE id=$1 AND customer_id=$2',[vehicle_id,req.user.sub]),
+    q('SELECT id,name,monthly_price,active FROM service_plans WHERE id=$1',[plan_id])
+  ]);
+  if(!vr.rows.length) return res.status(404).json({error:'Vehicle not found'});
+  if(!pr.rows.length || !pr.rows[0].active) return res.status(404).json({error:'Plan not found'});
+
+  const amount=Number(pr.rows[0].monthly_price);
+  if(!Number.isFinite(amount) || amount < 1) return res.status(400).json({error:'Invalid plan amount'});
+
+  const order=await razorpay.orders.create({
+    amount:Math.round(amount*100),
+    currency:'INR',
+    receipt:`ccb_${Date.now()}_${String(req.user.sub).slice(0,8)}`,
+    notes:{customer_id:req.user.sub,vehicle_id,plan_id}
+  });
+
+  const r=await q(`INSERT INTO payments(customer_id,subscription_id,booking_id,plan_id,vehicle_id,amount,gateway_order_amount,currency,status,payment_method,razorpay_order_id)
+    VALUES($1,NULL,NULL,$2,$3,$4,$5,'INR','created','razorpay',$6) RETURNING *`,
+    [req.user.sub,plan_id,vehicle_id,amount,order.amount,order.id]);
+
+  res.status(201).json({
+    key_id:process.env.RAZORPAY_KEY_ID,
+    order,
+    payment:r.rows[0],
+    plan:{id:pr.rows[0].id,name:pr.rows[0].name,monthly_price:amount},
+    vehicle:vr.rows[0]
+  });
+}));
+
+// Verifies the Razorpay signature on the server and confirms the payment is captured
+// before activating/updating the CarCareBay membership.
+app.post('/api/subscriptions/confirm-payment', auth, asyncRoute(async(req,res)=>{
+  const {payment_id,razorpay_order_id,razorpay_payment_id,razorpay_signature}=req.body || {};
+  if(!payment_id || !razorpay_order_id || !razorpay_payment_id || !razorpay_signature){
+    return res.status(400).json({error:'Payment verification details are incomplete'});
+  }
+  if(!razorpay) return res.status(503).json({error:'Razorpay is not configured'});
+
+  const paymentRow=await q(`SELECT * FROM payments WHERE id=$1 AND customer_id=$2 AND razorpay_order_id=$3 FOR UPDATE`,
+    [payment_id,req.user.sub,razorpay_order_id]);
+  if(!paymentRow.rows.length) return res.status(404).json({error:'Payment order not found'});
+  const pending=paymentRow.rows[0];
+
+  const expected=crypto.createHmac('sha256',process.env.RAZORPAY_KEY_SECRET)
+    .update(`${razorpay_order_id}|${razorpay_payment_id}`)
+    .digest('hex');
+  const receivedBuf=Buffer.from(String(razorpay_signature),'utf8');
+  const expectedBuf=Buffer.from(expected,'utf8');
+  if(receivedBuf.length!==expectedBuf.length || !crypto.timingSafeEqual(expectedBuf,receivedBuf)){
+    return res.status(400).json({error:'Payment signature verification failed'});
+  }
+
+  const rpPayment=await razorpay.payments.fetch(razorpay_payment_id);
+  if(String(rpPayment.order_id)!==String(razorpay_order_id)) return res.status(400).json({error:'Payment does not belong to this order'});
+  if(Number(rpPayment.amount)!==Number(pending.gateway_order_amount || Math.round(Number(pending.amount)*100))) return res.status(400).json({error:'Payment amount mismatch'});
+  if(String(rpPayment.status).toLowerCase()!=='captured') return res.status(400).json({error:`Payment is ${rpPayment.status}. Membership will activate only after capture.`});
+
+  const client=await pool.connect();
+  try{
+    await client.query('BEGIN');
+
+    const locked=(await client.query(`SELECT * FROM payments WHERE id=$1 AND customer_id=$2 FOR UPDATE`,[payment_id,req.user.sub])).rows[0];
+    if(!locked) throw new Error('Payment not found');
+
+    if(String(locked.status)==='paid'){
+      const existing=(await client.query(`SELECT * FROM subscriptions WHERE customer_id=$1 AND status='active' ORDER BY created_at DESC LIMIT 1`,[req.user.sub])).rows[0];
+      await client.query('COMMIT');
+      return res.json({payment:locked,subscription:existing || null,already_confirmed:true});
+    }
+
+    const plan=(await client.query('SELECT * FROM service_plans WHERE id=$1 AND active=true',[locked.plan_id])).rows[0];
+    const vehicle=(await client.query('SELECT id FROM vehicles WHERE id=$1 AND customer_id=$2',[locked.vehicle_id,req.user.sub])).rows[0];
+    if(!plan || !vehicle) throw new Error('Plan or vehicle is no longer available');
+
+    await client.query(`UPDATE payments SET razorpay_payment_id=$1,status='paid' WHERE id=$2`,[razorpay_payment_id,payment_id]);
+
+    const existing=(await client.query(`SELECT * FROM subscriptions WHERE customer_id=$1 AND status='active' ORDER BY created_at DESC LIMIT 1 FOR UPDATE`,[req.user.sub])).rows[0];
+    let subscription;
+    if(existing){
+      subscription=(await client.query(`UPDATE subscriptions SET vehicle_id=$1,plan_id=$2 WHERE id=$3 RETURNING *`,[locked.vehicle_id,locked.plan_id,existing.id])).rows[0];
+
+      const start=String(existing.start_date || new Date().toISOString().slice(0,10)).slice(0,10);
+      const end=existing.end_date ? String(existing.end_date).slice(0,10) : null;
+      let countSql=`SELECT count(*)::int AS count FROM bookings WHERE customer_id=$1 AND status <> 'cancelled' AND scheduled_date >= $2::date`;
+      const countParams=[req.user.sub,start];
+      if(end){countSql+=' AND scheduled_date <= $3::date';countParams.push(end);}
+      const countR=await client.query(countSql,countParams);
+      const total=Number(countR.rows[0]?.count||0);
+      const allowance=Math.max(0,Number(plan.wash_credits||0));
+      const excess=Math.max(0,total-allowance);
+      if(excess>0){
+        await client.query(`UPDATE bookings SET status='cancelled',customer_notes=CASE WHEN COALESCE(customer_notes,'')='' THEN 'Cancelled automatically after account plan change.' ELSE customer_notes || ' Cancelled automatically after account plan change.' END WHERE id IN (SELECT id FROM bookings WHERE customer_id=$1 AND status IN ('scheduled','assigned') AND scheduled_date >= CURRENT_DATE ORDER BY scheduled_date DESC, scheduled_time DESC NULLS LAST, created_at DESC LIMIT $2::int)`,[req.user.sub,excess]);
+      }
+    }else{
+      const startValue=new Date().toISOString().slice(0,10);
+      subscription=(await client.query(`INSERT INTO subscriptions(customer_id,vehicle_id,plan_id,status,start_date,end_date) VALUES($1,$2,$3,'active',$4,(($4::date + INTERVAL '1 month' - INTERVAL '1 day')::date)) RETURNING *`,[req.user.sub,locked.vehicle_id,locked.plan_id,startValue])).rows[0];
+    }
+
+    await client.query('UPDATE payments SET subscription_id=$1 WHERE id=$2',[subscription.id,payment_id]);
+    await client.query('COMMIT');
+    res.json({payment:{...(locked),status:'paid',razorpay_payment_id},subscription});
+  }catch(err){
+    try{await client.query('ROLLBACK')}catch{}
+    throw err;
+  }finally{client.release();}
+}));
+
+// Razorpay server-to-server webhook. Configure this URL in Razorpay Dashboard:
+// https://carcarebay.onrender.com/api/payments/webhook
+app.post('/api/payments/webhook', asyncRoute(async(req,res)=>{
+  const signature=req.headers['x-razorpay-signature'];
+  if(!process.env.RAZORPAY_WEBHOOK_SECRET) return res.status(503).json({error:'Razorpay webhook secret is not configured'});
+  const raw=req.rawBody || Buffer.from(JSON.stringify(req.body));
+  const expected=crypto.createHmac('sha256',process.env.RAZORPAY_WEBHOOK_SECRET).update(raw).digest('hex');
+  const receivedWebhook=Buffer.from(String(signature||''),'utf8');
+  const expectedWebhook=Buffer.from(expected,'utf8');
+  if(!signature || receivedWebhook.length!==expectedWebhook.length || !crypto.timingSafeEqual(expectedWebhook,receivedWebhook)) return res.status(400).json({error:'Invalid webhook signature'});
+
+  const event=req.body?.event;
+  const entity=req.body?.payload?.payment?.entity;
+  if(entity?.order_id){
+    if(event==='payment.captured' || event==='order.paid'){
+      await q(`UPDATE payments SET status='paid',razorpay_payment_id=COALESCE($1,razorpay_payment_id) WHERE razorpay_order_id=$2`,[entity.id,entity.order_id]);
+    }else if(event==='payment.failed'){
+      await q(`UPDATE payments SET status='failed',razorpay_payment_id=COALESCE($1,razorpay_payment_id) WHERE razorpay_order_id=$2 AND status <> 'paid'`,[entity.id,entity.order_id]);
+    }
+  }
+  const paymentLinkEntity=req.body?.payload?.payment_link?.entity;
+  if(event==='payment_link.paid' && paymentLinkEntity?.id){
+    const local=(await q('SELECT id,customer_id FROM payments WHERE razorpay_payment_link_id=$1 LIMIT 1',[paymentLinkEntity.id])).rows[0];
+    if(local) await activatePaidMembership(local.id,local.customer_id,paymentLinkEntity.payments?.[0]?.payment_id || null);
+  }
+  res.json({received:true});
+}));
+
+
+// Expo Go-friendly membership checkout using a hosted Razorpay Payment Link.
+app.post('/api/subscriptions/payment-link', auth, asyncRoute(async(req,res)=>{
+  const {vehicle_id,plan_id}=req.body || {};
+  if(!vehicle_id || !plan_id) return res.status(400).json({error:'vehicle_id and plan_id are required'});
+  if(!razorpay) return res.status(503).json({error:'Razorpay is not configured. Add RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET in Render.'});
+  const [vr,pr,cr]=await Promise.all([
+    q('SELECT id,make,model,registration_number FROM vehicles WHERE id=$1 AND customer_id=$2',[vehicle_id,req.user.sub]),
+    q('SELECT id,name,monthly_price,active FROM service_plans WHERE id=$1',[plan_id]),
+    q('SELECT id,full_name,email,phone FROM customers WHERE id=$1',[req.user.sub])
+  ]);
+  if(!vr.rows.length) return res.status(404).json({error:'Vehicle not found'});
+  if(!pr.rows.length || !pr.rows[0].active) return res.status(404).json({error:'Plan not found'});
+  const customer=cr.rows[0];
+  const amount=Number(pr.rows[0].monthly_price);
+  if(!Number.isFinite(amount) || amount<1) return res.status(400).json({error:'Invalid plan amount'});
+  const reference=`CCB${Date.now()}`.slice(0,40);
+  const callbackUrl=process.env.RAZORPAY_PAYMENT_LINK_CALLBACK_URL || 'https://carcarebay.onrender.com/payment-result';
+  const authHeader='Basic '+Buffer.from(`${process.env.RAZORPAY_KEY_ID}:${process.env.RAZORPAY_KEY_SECRET}`).toString('base64');
+  const response=await fetch('https://api.razorpay.com/v1/payment_links',{method:'POST',headers:{Authorization:authHeader,'Content-Type':'application/json'},body:JSON.stringify({
+    amount:Math.round(amount*100),currency:'INR',accept_partial:false,reference_id:reference,
+    description:`CarCareBay ${pr.rows[0].name} membership`,
+    customer:{name:customer?.full_name || req.user.name || 'CarCareBay customer',contact:customer?.phone || req.user.phone || undefined,email:customer?.email || undefined},
+    notify:{email:false,sms:false},reminder_enable:false,callback_url:callbackUrl,callback_method:'get',
+    notes:{customer_id:String(req.user.sub),vehicle_id:String(vehicle_id),plan_id:String(plan_id),reference_id:reference}
+  })});
+  const link=await response.json().catch(()=>({}));
+  if(!response.ok) return res.status(response.status).json({error:link?.error?.description || link?.error?.message || 'Could not create Razorpay payment link'});
+  const payment=(await q(`INSERT INTO payments(customer_id,subscription_id,booking_id,plan_id,vehicle_id,amount,gateway_order_amount,currency,status,payment_method,razorpay_payment_link_id)
+    VALUES($1,NULL,NULL,$2,$3,$4,$5,'INR','created','razorpay_payment_link',$6) RETURNING *`,[req.user.sub,plan_id,vehicle_id,amount,link.amount,link.id])).rows[0];
+  res.status(201).json({payment,payment_link:{id:link.id,short_url:link.short_url,status:link.status,amount:link.amount},plan:pr.rows[0],vehicle:vr.rows[0]});
+}));
+
+app.get('/api/subscriptions/payment-link-status/:paymentId', auth, asyncRoute(async(req,res)=>{
+  if(!razorpay) return res.status(503).json({error:'Razorpay is not configured'});
+  const local=(await q('SELECT * FROM payments WHERE id=$1 AND customer_id=$2',[req.params.paymentId,req.user.sub])).rows[0];
+  if(!local) return res.status(404).json({error:'Payment not found'});
+  if(String(local.status)==='paid') return res.json({status:'paid',payment:local,subscription:(await q(`SELECT * FROM subscriptions WHERE customer_id=$1 AND status='active' ORDER BY created_at DESC LIMIT 1`,[req.user.sub])).rows[0] || null});
+  if(!local.razorpay_payment_link_id) return res.status(400).json({error:'Payment link not found'});
+  const authHeader='Basic '+Buffer.from(`${process.env.RAZORPAY_KEY_ID}:${process.env.RAZORPAY_KEY_SECRET}`).toString('base64');
+  const response=await fetch(`https://api.razorpay.com/v1/payment_links/${encodeURIComponent(local.razorpay_payment_link_id)}`,{headers:{Authorization:authHeader}});
+  const link=await response.json().catch(()=>({}));
+  if(!response.ok) return res.status(response.status).json({error:link?.error?.description || 'Could not check payment status'});
+  if(String(link.status).toLowerCase()==='paid'){
+    const paidId=link.payments?.[0]?.payment_id || null;
+    const activated=await activatePaidMembership(local.id,req.user.sub,paidId);
+    return res.json({status:'paid',payment:activated.payment,subscription:activated.subscription});
+  }
+  if(['cancelled','expired'].includes(String(link.status).toLowerCase())) await q(`UPDATE payments SET status='failed' WHERE id=$1 AND status <> 'paid'`,[local.id]);
+  res.json({status:String(link.status || local.status),payment:local,payment_link:link});
+}));
+
+app.get('/payment-result',(req,res)=>res.type('html').send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>CarCareBay Payment</title><style>body{font-family:Arial,sans-serif;background:#f4f8fc;color:#10243a;padding:30px;text-align:center}.card{max-width:520px;margin:50px auto;background:#fff;border-radius:18px;padding:28px;box-shadow:0 8px 30px #183a5915}h1{margin-top:0}p{color:#60748a}</style></head><body><div class="card"><h1>Payment received</h1><p>Return to the CarCareBay app and tap “Check payment” to activate your membership.</p></div></body></html>`));
+// Compatibility alias: supports older Render callback configuration.
+app.get('/api/payments/callback',(req,res)=>res.redirect(302,'/payment-result'));
+
+// Legacy order endpoint retained for non-membership future services.
 app.post('/api/payments/order', auth, asyncRoute(async(req,res)=>{
   const {subscription_id,booking_id,amount}=req.body;
   if(!amount)return res.status(400).json({error:'amount is required'});
   if(!razorpay)return res.status(503).json({error:'Razorpay is not configured'});
   const order=await razorpay.orders.create({amount:Math.round(Number(amount)*100),currency:'INR',receipt:`ccb_${Date.now()}`});
-  const r=await q(`INSERT INTO payments(customer_id,subscription_id,booking_id,amount,currency,status,payment_method,razorpay_order_id)
-    VALUES($1,$2,$3,$4,'INR','created','razorpay',$5) RETURNING *`,
-    [req.user.sub,subscription_id || null,booking_id || null,Number(amount),order.id]);
-  res.status(201).json({order,payment:r.rows[0]});
+  const r=await q(`INSERT INTO payments(customer_id,subscription_id,booking_id,amount,currency,status,payment_method,razorpay_order_id,gateway_order_amount)
+    VALUES($1,$2,$3,$4,'INR','created','razorpay',$5,$6) RETURNING *`,
+    [req.user.sub,subscription_id || null,booking_id || null,Number(amount),order.id,order.amount]);
+  res.status(201).json({order,payment:r.rows[0],key_id:process.env.RAZORPAY_KEY_ID});
 }));
 
 app.post('/api/payments/verify', auth, asyncRoute(async(req,res)=>{
-  const {razorpay_order_id,razorpay_payment_id,payment_id,status='paid'}=req.body;
-  const id=payment_id;
-  const r=await q(`UPDATE payments SET razorpay_payment_id=$1,status=$2 WHERE id=$3 AND customer_id=$4 RETURNING *`,
-    [razorpay_payment_id || null,status,id,req.user.sub]);
+  const {razorpay_order_id,razorpay_payment_id,razorpay_signature}=req.body || {};
+  if(!razorpay || !razorpay_order_id || !razorpay_payment_id || !razorpay_signature) return res.status(400).json({error:'Complete payment verification details are required'});
+  const r=await q(`SELECT * FROM payments WHERE razorpay_order_id=$1 AND customer_id=$2`,[razorpay_order_id,req.user.sub]);
   if(!r.rows.length)return res.status(404).json({error:'Payment not found'});
-  res.json(r.rows[0]);
+  const expected=crypto.createHmac('sha256',process.env.RAZORPAY_KEY_SECRET).update(`${razorpay_order_id}|${razorpay_payment_id}`).digest('hex');
+  const receivedLegacy=Buffer.from(String(razorpay_signature),'utf8');
+  const expectedLegacy=Buffer.from(expected,'utf8');
+  if(receivedLegacy.length!==expectedLegacy.length || !crypto.timingSafeEqual(expectedLegacy,receivedLegacy)) return res.status(400).json({error:'Payment signature verification failed'});
+  const rp=await razorpay.payments.fetch(razorpay_payment_id);
+  if(String(rp.status).toLowerCase()!=='captured') return res.status(400).json({error:`Payment is ${rp.status}`});
+  const updated=await q(`UPDATE payments SET razorpay_payment_id=$1,status='paid' WHERE id=$2 AND customer_id=$3 RETURNING *`,[razorpay_payment_id,r.rows[0].id,req.user.sub]);
+  res.json(updated.rows[0]);
 }));
 
 /* ---------- DASHBOARDS ---------- */
