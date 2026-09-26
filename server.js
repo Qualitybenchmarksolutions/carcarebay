@@ -96,6 +96,12 @@ async function ensureVehicleLocationFields() {
 }
 ensureVehicleLocationFields().catch(e => console.error('vehicle location fields setup failed:', e.message));
 
+async function ensureBookingMediaFields() {
+  await q(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS before_video_url text`);
+  await q(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS after_video_url text`);
+}
+ensureBookingMediaFields().catch(e => console.error('booking media fields setup failed:', e.message));
+
 async function ensureApartmentLocationColumns() {
   await q(`ALTER TABLE apartments ADD COLUMN IF NOT EXISTS locality text`);
   await q(`ALTER TABLE apartments ADD COLUMN IF NOT EXISTS latitude numeric`);
@@ -554,6 +560,32 @@ app.patch('/api/apartment-service-requests/:id', auth, roles('admin'), asyncRout
   res.json(r.rows[0]);
 }));
 
+app.post('/api/apartment-service-requests/:id/fulfill', auth, roles('admin'), asyncRoute(async (req,res)=>{
+  await ensureApartmentRequestTable();
+  const requestId=req.params.id;
+  const rr=await q('SELECT * FROM apartment_service_requests WHERE id=$1',[requestId]);
+  if(!rr.rows.length)return res.status(404).json({error:'Request not found'});
+  const r=rr.rows[0];
+  if(String(r.status).toLowerCase()==='fulfilled')return res.status(409).json({error:'Request is already fulfilled'});
+  const {name,address,locality,city,pincode,total_cars,status,latitude,longitude,google_place_id}=req.body||{};
+  const communityName=String(name||r.community_name||'').trim();
+  if(!communityName)return res.status(400).json({error:'Community name is required'});
+  const existing=await q('SELECT * FROM apartments WHERE LOWER(name)=LOWER($1) LIMIT 1',[communityName]);
+  let apartment;
+  if(existing.rows.length){
+    const up=await q(`UPDATE apartments SET address=COALESCE($2,address),locality=COALESCE($3,locality),city=COALESCE($4,city),pincode=COALESCE($5,pincode),total_cars=CASE WHEN $6::int>0 THEN $6 ELSE total_cars END,status=COALESCE($7,status),latitude=COALESCE($8,latitude),longitude=COALESCE($9,longitude),google_place_id=COALESCE($10,google_place_id) WHERE id=$1 RETURNING *`,[existing.rows[0].id,address||null,locality||r.locality||null,city||r.city||null,pincode||r.pincode||null,Number(total_cars||0),status||'active',latitude==null?null:Number(latitude),longitude==null?null:Number(longitude),google_place_id||null]);
+    apartment=up.rows[0];
+  } else {
+    const ins=await q(`INSERT INTO apartments(name,address,locality,city,pincode,total_cars,status,latitude,longitude,google_place_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,[communityName,address||null,locality||r.locality||null,city||r.city||null,pincode||r.pincode||null,Number(total_cars||0),status||'active',latitude==null?r.latitude:Number(latitude),longitude==null?r.longitude:Number(longitude),google_place_id||null]);
+    apartment=ins.rows[0];
+  }
+  await q(`UPDATE apartment_service_requests SET status='fulfilled',updated_at=now(),notes=CASE WHEN notes IS NULL OR notes='' THEN $2 ELSE notes END WHERE id=$1`,[requestId,`Fulfilled and added as ${apartment.name}`]);
+  if(r.customer_id){
+    await q(`INSERT INTO notifications(customer_id,title,message,notification_type) VALUES($1,$2,$3,$4)`,[r.customer_id,'Community is now serviceable',`${apartment.name} has been added to CarCareBay. You can now select it when adding or updating your vehicle.`,'community_request']);
+  }
+  res.json({request:{...r,status:'fulfilled'},apartment});
+}));
+
 /* ---------- GOOGLE APARTMENT MAPPING ---------- */
 
 app.post('/api/admin/apartments/search-google', auth, roles('admin'), asyncRoute(async (req,res)=>{
@@ -735,30 +767,33 @@ app.get('/api/bookings', auth, asyncRoute(async(req,res)=>{
     r=await q(`
       SELECT b.*, c.full_name AS customer_name,c.phone AS customer_phone,
              v.registration_number,v.make,v.model,
-             a.name AS apartment_name,p.full_name AS partner_name
+             a.name AS apartment_name,p.full_name AS partner_name,rt.rating,rt.comment AS rating_comment
       FROM bookings b
       JOIN customers c ON c.id=b.customer_id
       JOIN vehicles v ON v.id=b.vehicle_id
       LEFT JOIN apartments a ON a.id=b.apartment_id
       LEFT JOIN partners p ON p.id=b.partner_id
+      LEFT JOIN LATERAL (SELECT rating,comment FROM ratings WHERE booking_id=b.id ORDER BY created_at DESC LIMIT 1) rt ON true
       ORDER BY b.scheduled_date DESC,b.scheduled_time DESC
     `);
   } else if(req.user.role==='partner'){
     r=await q(`
       SELECT b.*, c.full_name AS customer_name,c.phone AS customer_phone,
-             v.registration_number,v.make,v.model,a.name AS apartment_name
+             v.registration_number,v.make,v.model,a.name AS apartment_name,rt.rating,rt.comment AS rating_comment
       FROM bookings b JOIN customers c ON c.id=b.customer_id
       JOIN vehicles v ON v.id=b.vehicle_id
       LEFT JOIN apartments a ON a.id=b.apartment_id
+      LEFT JOIN LATERAL (SELECT rating,comment FROM ratings WHERE booking_id=b.id ORDER BY created_at DESC LIMIT 1) rt ON true
       WHERE b.partner_id=$1 ORDER BY b.scheduled_date,b.scheduled_time
     `,[req.user.sub]);
   } else {
     r=await q(`
       SELECT b.*, v.registration_number,v.make,v.model,a.name AS apartment_name,
-             p.full_name AS partner_name
+             p.full_name AS partner_name,rt.rating,rt.comment AS rating_comment
       FROM bookings b JOIN vehicles v ON v.id=b.vehicle_id
       LEFT JOIN apartments a ON a.id=b.apartment_id
       LEFT JOIN partners p ON p.id=b.partner_id
+      LEFT JOIN LATERAL (SELECT rating,comment FROM ratings WHERE booking_id=b.id ORDER BY created_at DESC LIMIT 1) rt ON true
       WHERE b.customer_id=$1 ORDER BY b.scheduled_date DESC,b.scheduled_time DESC
     `,[req.user.sub]);
   }
@@ -891,7 +926,7 @@ app.post('/api/bookings', auth, asyncRoute(async(req,res)=>{
 }));
 
 app.patch('/api/bookings/:id', auth, asyncRoute(async(req,res)=>{
-  const fields=['parking_bay_id','service_type','scheduled_date','scheduled_time','status','customer_notes','partner_notes','partner_id','before_photo_url','after_photo_url','started_at','completed_at'].filter(k=>Object.hasOwn(req.body,k));
+  const fields=['parking_bay_id','service_type','scheduled_date','scheduled_time','status','customer_notes','partner_notes','partner_id','before_photo_url','after_photo_url','before_video_url','after_video_url','started_at','completed_at'].filter(k=>Object.hasOwn(req.body,k));
   if(!fields.length)return res.status(400).json({error:'No fields to update'});
   const existing=(await q('SELECT * FROM bookings WHERE id=$1',[req.params.id])).rows[0];
   if(!existing)return res.status(404).json({error:'Booking not found'});
@@ -968,11 +1003,16 @@ app.post('/api/bookings/:id/start', auth, roles('partner','admin'), asyncRoute(a
 
 app.post('/api/bookings/:id/complete', auth, roles('partner','admin'), asyncRoute(async(req,res)=>{
   const r=await q(`UPDATE bookings SET status='completed',completed_at=now(),after_photo_url=COALESCE($2,after_photo_url),partner_notes=COALESCE($3,partner_notes)
-    WHERE id=$1 ${req.user.role==='partner'?'AND partner_id=$4':''} RETURNING *`,
+    WHERE id=$1 AND status='in_progress' ${req.user.role==='partner'?'AND partner_id=$4':''} RETURNING *`,
     req.user.role==='partner'
       ? [req.params.id,req.body.after_photo_url || null,req.body.partner_notes || null,req.user.sub]
       : [req.params.id,req.body.after_photo_url || null,req.body.partner_notes || null]);
-  if(!r.rows.length)return res.status(404).json({error:'Booking not found'});
+  if(!r.rows.length)return res.status(404).json({error:'Only an in-progress job can be completed.'});
+  if(req.user.role==='partner'){
+    await q(`UPDATE partners SET jobs_completed=COALESCE(jobs_completed,0)+1 WHERE id=$1`,[req.user.sub]);
+  } else if(r.rows[0].partner_id){
+    await q(`UPDATE partners SET jobs_completed=COALESCE(jobs_completed,0)+1 WHERE id=$1`,[r.rows[0].partner_id]);
+  }
   res.json(r.rows[0]);
 }));
 
@@ -1030,8 +1070,15 @@ app.patch('/api/partners/:id', auth, roles('admin'), asyncRoute(async(req,res)=>
 app.post('/api/bookings/:id/assign-partner', auth, roles('admin'), asyncRoute(async(req,res)=>{
   const {partner_id}=req.body;
   if(!partner_id)return res.status(400).json({error:'partner_id is required'});
-  const r=await q(`UPDATE bookings SET partner_id=$1,status='assigned' WHERE id=$2 RETURNING *`,[partner_id,req.params.id]);
-  if(!r.rows.length)return res.status(404).json({error:'Booking not found'});
+  const existing=await q('SELECT id,status,partner_id FROM bookings WHERE id=$1',[req.params.id]);
+  if(!existing.rows.length)return res.status(404).json({error:'Booking not found'});
+  const current=String(existing.rows[0].status||'').toLowerCase();
+  if(current!=='scheduled')return res.status(409).json({error:'Only scheduled bookings can be assigned to an employee.'});
+  const partner=await q(`SELECT id,status FROM partners WHERE id=$1`,[partner_id]);
+  if(!partner.rows.length)return res.status(404).json({error:'Employee not found'});
+  if(String(partner.rows[0].status||'').toLowerCase()!=='active')return res.status(409).json({error:'Only active employees can be assigned.'});
+  const r=await q(`UPDATE bookings SET partner_id=$1,status='assigned' WHERE id=$2 AND status='scheduled' RETURNING *`,[partner_id,req.params.id]);
+  if(!r.rows.length)return res.status(409).json({error:'Only scheduled bookings can be assigned to an employee.'});
   res.json(r.rows[0]);
 }));
 
@@ -1041,8 +1088,13 @@ app.post('/api/ratings', auth, asyncRoute(async(req,res)=>{
   const {booking_id,rating,comment}=req.body;
   if(!booking_id || !rating)return res.status(400).json({error:'booking_id and rating are required'});
   if(Number(rating)<1 || Number(rating)>5)return res.status(400).json({error:'rating must be between 1 and 5'});
-  const b=await q('SELECT * FROM bookings WHERE id=$1 AND customer_id=$2',[booking_id,req.user.sub]);
-  if(!b.rows.length)return res.status(404).json({error:'Booking not found'});
+  const b=await q('SELECT * FROM bookings WHERE id=$1 AND customer_id=$2 AND status='completed'',[booking_id,req.user.sub]);
+  if(!b.rows.length)return res.status(404).json({error:'Completed booking not found'});
+  const existing=await q('SELECT id FROM ratings WHERE booking_id=$1 AND customer_id=$2 LIMIT 1',[booking_id,req.user.sub]);
+  if(existing.rows.length){
+    const r=await q('UPDATE ratings SET rating=$1,comment=$2 WHERE id=$3 RETURNING *',[Number(rating),comment || null,existing.rows[0].id]);
+    return res.json(r.rows[0]);
+  }
   const r=await q(`INSERT INTO ratings(booking_id,customer_id,partner_id,rating,comment)
     VALUES($1,$2,$3,$4,$5) RETURNING *`,
     [booking_id,req.user.sub,b.rows[0].partner_id || null,Number(rating),comment || null]);
