@@ -285,12 +285,20 @@ app.post('/api/auth/login', asyncRoute(async (req, res) => {
     WHERE a.phone=$1
     LIMIT 1
   `, [phone]);
+  const pr = r.rows.length ? r : await q(`
+    SELECT p.*, a.password_hash, a.role
+    FROM partners p
+    JOIN auth_credentials a ON a.profile_id=p.id
+    WHERE a.phone=$1
+    LIMIT 1
+  `, [phone]);
 
-  if (!r.rows.length || !(await bcrypt.compare(password, r.rows[0].password_hash))) {
+  if (!pr.rows.length || !(await bcrypt.compare(password, pr.rows[0].password_hash))) {
     return res.status(401).json({ error: 'Invalid phone or password' });
   }
 
-  const { password_hash, ...user } = r.rows[0];
+  const { password_hash, ...user } = pr.rows[0];
+  if (!user.role) user.role = r.rows.length ? 'customer' : 'partner';
   if (user.status && user.status !== 'active') return res.status(403).json({ error: 'Account is not active' });
   res.json({ token: sign(user), user });
 }));
@@ -341,6 +349,11 @@ app.post('/api/auth/bootstrap-admin', asyncRoute(async (req, res) => {
 }));
 
 app.get('/api/me', auth, asyncRoute(async (req, res) => {
+  if(req.user.role==='partner'){
+    const r=await q('SELECT * FROM partners WHERE id=$1',[req.user.sub]);
+    if(!r.rows.length)return res.status(404).json({error:'Employee not found'});
+    return res.json({...r.rows[0],role:'partner'});
+  }
   await ensureProfileFields();
   const r = await q('SELECT * FROM customers WHERE id=$1', [req.user.sub]);
   if (!r.rows.length) return res.status(404).json({ error: 'Customer not found' });
@@ -965,6 +978,18 @@ app.post('/api/bookings/:id/complete', auth, roles('partner','admin'), asyncRout
 
 /* ---------- PARTNERS ---------- */
 
+app.get('/api/customers', auth, roles('admin'), asyncRoute(async(_,res)=>{
+  const r=await q(`
+    SELECT c.id,c.full_name,c.phone,c.email,c.status,c.created_at,
+           a.name AS apartment_name,
+           (SELECT count(*)::int FROM vehicles v WHERE v.customer_id=c.id) AS vehicle_count,
+           (SELECT count(*)::int FROM bookings b WHERE b.customer_id=c.id) AS booking_count
+    FROM customers c LEFT JOIN apartments a ON a.id=c.apartment_id
+    WHERE c.role='customer' ORDER BY c.created_at DESC
+  `);
+  res.json(r.rows);
+}));
+
 app.get('/api/partners', auth, roles('admin'), asyncRoute(async(_,res)=>{
   const r=await q(`
     SELECT p.*,COALESCE(x.job_count,0)::int AS current_jobs
@@ -978,11 +1003,17 @@ app.get('/api/partners', auth, roles('admin'), asyncRoute(async(_,res)=>{
 }));
 
 app.post('/api/partners', auth, roles('admin'), asyncRoute(async(req,res)=>{
-  const {full_name,phone,email,employee_code,status}=req.body;
-  if(!full_name || !phone)return res.status(400).json({error:'full_name and phone are required'});
+  const {full_name,phone,email,employee_code,status,password}=req.body;
+  if(!full_name || !phone || !password)return res.status(400).json({error:'full_name, phone and password are required'});
+  if(String(password).length<6)return res.status(400).json({error:'Employee password must be at least 6 characters'});
+  const existing=await q('SELECT id FROM partners WHERE phone=$1 LIMIT 1',[phone]);
+  if(existing.rows.length)return res.status(409).json({error:'An employee with this phone already exists'});
   const r=await q(`INSERT INTO partners(full_name,phone,email,employee_code,status,rating,jobs_completed)
     VALUES($1,$2,$3,$4,$5,0,0) RETURNING *`,
     [full_name,phone,email || null,employee_code || null,status || 'active']);
+  const hash=await bcrypt.hash(password,12);
+  await q(`DELETE FROM auth_credentials WHERE profile_id=$1 OR phone=$2`,[r.rows[0].id,phone]);
+  await q(`INSERT INTO auth_credentials(id,phone,password_hash,role,profile_id) VALUES(gen_random_uuid(),$1,$2,'partner',$3)`,[phone,hash,r.rows[0].id]);
   res.status(201).json(r.rows[0]);
 }));
 
