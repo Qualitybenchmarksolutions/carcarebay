@@ -97,12 +97,33 @@ async function ensureVehicleLocationFields() {
 ensureVehicleLocationFields().catch(e => console.error('vehicle location fields setup failed:', e.message));
 
 async function ensureApartmentLocationColumns() {
+  await q(`ALTER TABLE apartments ADD COLUMN IF NOT EXISTS locality text`);
   await q(`ALTER TABLE apartments ADD COLUMN IF NOT EXISTS latitude numeric`);
   await q(`ALTER TABLE apartments ADD COLUMN IF NOT EXISTS longitude numeric`);
   await q(`ALTER TABLE apartments ADD COLUMN IF NOT EXISTS google_place_id text`);
   await q(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS profile_photo_url text`);
 }
 ensureApartmentLocationColumns().catch(e => console.error('apartment location setup failed:', e.message));
+
+async function ensureApartmentRequestTable() {
+  await q(`CREATE TABLE IF NOT EXISTS apartment_service_requests (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    customer_id uuid REFERENCES customers(id) ON DELETE SET NULL,
+    community_name text NOT NULL,
+    locality text,
+    city text,
+    pincode text,
+    notes text,
+    latitude numeric,
+    longitude numeric,
+    status text NOT NULL DEFAULT 'requested',
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now()
+  )`);
+  await q(`CREATE INDEX IF NOT EXISTS apartment_service_requests_status_idx ON apartment_service_requests(status)`);
+  await q(`CREATE INDEX IF NOT EXISTS apartment_service_requests_customer_idx ON apartment_service_requests(customer_id)`);
+}
+ensureApartmentRequestTable().catch(e => console.error('apartment request table setup failed:', e.message));
 
 const sign = u => jwt.sign(
   { sub: u.id, role: u.role, name: u.full_name, phone: u.phone },
@@ -463,18 +484,18 @@ app.get('/api/apartments', auth, asyncRoute(async (req, res) => {
 }));
 
 app.post('/api/apartments', auth, roles('admin'), asyncRoute(async (req, res) => {
-  const { name, address, city, pincode, total_cars, status, latitude, longitude, google_place_id } = req.body;
+  const { name, address, locality, city, pincode, total_cars, status, latitude, longitude, google_place_id } = req.body;
   if (!name) return res.status(400).json({ error: 'name is required' });
   const r = await q(`
-    INSERT INTO apartments(name,address,city,pincode,total_cars,status,latitude,longitude,google_place_id)
-    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *
-  `, [name,address || null,city || null,pincode || null,Number(total_cars || 0),status || 'active',
+    INSERT INTO apartments(name,address,locality,city,pincode,total_cars,status,latitude,longitude,google_place_id)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *
+  `, [name,address || null,locality || null,city || null,pincode || null,Number(total_cars || 0),status || 'active',
       latitude == null ? null : Number(latitude), longitude == null ? null : Number(longitude), google_place_id || null]);
   res.status(201).json(r.rows[0]);
 }));
 
 app.patch('/api/apartments/:id', auth, roles('admin'), asyncRoute(async (req,res)=>{
-  const allowed=['name','address','city','pincode','total_cars','status','latitude','longitude','google_place_id'];
+  const allowed=['name','address','locality','city','pincode','total_cars','status','latitude','longitude','google_place_id'];
   const fields=allowed.filter(k=>Object.hasOwn(req.body,k));
   if(!fields.length) return res.status(400).json({error:'No fields to update'});
   const vals=fields.map(k=>['latitude','longitude'].includes(k) && req.body[k] !== null ? Number(req.body[k]) : req.body[k]);
@@ -482,6 +503,41 @@ app.patch('/api/apartments/:id', auth, roles('admin'), asyncRoute(async (req,res
   vals.push(req.params.id);
   const r=await q(`UPDATE apartments SET ${set} WHERE id=$${vals.length} RETURNING *`,vals);
   if(!r.rows.length)return res.status(404).json({error:'Apartment not found'});
+  res.json(r.rows[0]);
+}));
+
+
+/* ---------- APARTMENT SERVICE REQUESTS ---------- */
+
+app.post('/api/apartment-service-requests', auth, asyncRoute(async (req,res)=>{
+  const {community_name,locality,city,pincode,notes,latitude,longitude}=req.body||{};
+  if(!String(community_name||'').trim()) return res.status(400).json({error:'community_name is required'});
+  await ensureApartmentRequestTable();
+  const existing=await q(`SELECT id,status FROM apartment_service_requests WHERE customer_id=$1 AND LOWER(community_name)=LOWER($2) AND status IN ('requested','reviewing') ORDER BY created_at DESC LIMIT 1`,[req.user.sub,String(community_name).trim()]);
+  if(existing.rows.length) return res.status(409).json({error:'You already requested CarCareBay service for this community.',request:existing.rows[0]});
+  const r=await q(`INSERT INTO apartment_service_requests(customer_id,community_name,locality,city,pincode,notes,latitude,longitude) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,[
+    req.user.sub,String(community_name).trim(),locality||null,city||null,pincode||null,notes||null,
+    latitude==null?null:Number(latitude),longitude==null?null:Number(longitude)
+  ]);
+  res.status(201).json(r.rows[0]);
+}));
+
+app.get('/api/apartment-service-requests', auth, roles('admin'), asyncRoute(async (req,res)=>{
+  await ensureApartmentRequestTable();
+  const r=await q(`SELECT r.*, c.full_name AS customer_name, c.phone AS customer_phone FROM apartment_service_requests r LEFT JOIN customers c ON c.id=r.customer_id ORDER BY r.created_at DESC`);
+  res.json(r.rows);
+}));
+
+app.patch('/api/apartment-service-requests/:id', auth, roles('admin'), asyncRoute(async (req,res)=>{
+  await ensureApartmentRequestTable();
+  const allowed=['status','notes'];
+  const fields=allowed.filter(k=>Object.hasOwn(req.body,k));
+  if(!fields.length) return res.status(400).json({error:'No fields to update'});
+  const vals=fields.map(k=>req.body[k]);
+  const set=fields.map((k,i)=>`${k}=$${i+1}`).join(',');
+  vals.push(req.params.id);
+  const r=await q(`UPDATE apartment_service_requests SET ${set}, updated_at=now() WHERE id=$${vals.length} RETURNING *`,vals);
+  if(!r.rows.length) return res.status(404).json({error:'Request not found'});
   res.json(r.rows[0]);
 }));
 
