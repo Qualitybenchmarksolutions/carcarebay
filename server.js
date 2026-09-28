@@ -102,7 +102,7 @@ async function ensureVehicleAddressFields(){
   await q(`ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS pincode text`);
   await q(`ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS landmark text`);
 }
-ensureVehicleAddressFields().catch(e => console.error('vehicle address setup failed:', e.message));
+const vehicleAddressFieldsReady = ensureVehicleAddressFields().catch(e => { console.error('vehicle address setup failed:', e.message); throw e; });
 async function ensureNotificationFields(){
   await q(`ALTER TABLE notifications ADD COLUMN IF NOT EXISTS notification_type text`);
   await q(`ALTER TABLE notifications ADD COLUMN IF NOT EXISTS customer_id uuid`);
@@ -493,11 +493,13 @@ app.get('/api/plans', asyncRoute(async (_, res) => {
 /* ---------- VEHICLES ---------- */
 
 app.get('/api/vehicles', auth, asyncRoute(async (req, res) => {
+  await vehicleAddressFieldsReady;
   const r = await q('SELECT * FROM vehicles WHERE customer_id=$1 AND deleted_at IS NULL ORDER BY created_at DESC', [req.user.sub]);
   res.json(r.rows);
 }));
 
 app.post('/api/vehicles', auth, asyncRoute(async (req, res) => {
+  await vehicleAddressFieldsReady;
   const { make, model, registration_number, color, vehicle_type, parking_bay_id, tower_block, wing, flat_number, floor_number, service_address, address_line2, city, pincode, landmark } = req.body;
   if (!registration_number) return res.status(400).json({ error: 'registration_number is required' });
 
@@ -518,6 +520,7 @@ app.post('/api/vehicles', auth, asyncRoute(async (req, res) => {
 }));
 
 app.patch('/api/vehicles/:id', auth, asyncRoute(async (req, res) => {
+  await vehicleAddressFieldsReady;
   const current=(await q('SELECT * FROM vehicles WHERE id=$1 AND customer_id=$2 AND deleted_at IS NULL',[req.params.id,req.user.sub])).rows[0];
   if(!current) return res.status(404).json({error:'Vehicle not found'});
   const allowed = ['make','model','registration_number','color','vehicle_type','parking_bay_id','tower_block','wing','flat_number','floor_number','service_address','address_line2','city','pincode','landmark'];
@@ -959,6 +962,7 @@ app.get('/api/availability', auth, asyncRoute(async(req,res)=>{
 }));
 
 app.post('/api/bookings', auth, asyncRoute(async(req,res)=>{
+  await vehicleAddressFieldsReady;
   const {vehicle_id,apartment_id,parking_bay_id,service_type,scheduled_date,scheduled_time,customer_notes}=req.body;
   if(!vehicle_id || !service_type || !scheduled_date || !scheduled_time)return res.status(400).json({error:'vehicle_id, service_type, scheduled_date and scheduled_time are required'});
   const vr=await q('SELECT * FROM vehicles WHERE id=$1 AND customer_id=$2',[vehicle_id,req.user.sub]);
