@@ -95,12 +95,33 @@ async function ensureVehicleLocationFields() {
   await q(`ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS floor_number integer`);
 }
 ensureVehicleLocationFields().catch(e => console.error('vehicle location fields setup failed:', e.message));
+async function ensureVehicleAddressFields(){
+  await q(`ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS service_address text`);
+  await q(`ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS address_line2 text`);
+  await q(`ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS city text`);
+  await q(`ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS pincode text`);
+  await q(`ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS landmark text`);
+}
+ensureVehicleAddressFields().catch(e => console.error('vehicle address setup failed:', e.message));
+async function ensureNotificationFields(){
+  await q(`ALTER TABLE notifications ADD COLUMN IF NOT EXISTS notification_type text`);
+  await q(`ALTER TABLE notifications ADD COLUMN IF NOT EXISTS customer_id uuid`);
+  await q(`ALTER TABLE notifications ADD COLUMN IF NOT EXISTS partner_id uuid`);
+  await q(`ALTER TABLE partners ADD COLUMN IF NOT EXISTS expo_push_token text`);
+  await q(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS expo_push_token text`);
+}
+ensureNotificationFields().catch(e => console.error('notification setup failed:', e.message));
 
 async function ensureBookingMediaFields() {
   await q(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS before_video_url text`);
   await q(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS after_video_url text`);
 }
 ensureBookingMediaFields().catch(e => console.error('booking media fields setup failed:', e.message));
+
+async function ensureBookingLocationFlexibility(){
+  await q(`ALTER TABLE bookings ALTER COLUMN apartment_id DROP NOT NULL`).catch(()=>{});
+}
+ensureBookingLocationFlexibility().catch(e=>console.error('booking location flexibility setup failed:',e.message));
 
 async function ensureApartmentLocationColumns() {
   await q(`ALTER TABLE apartments ADD COLUMN IF NOT EXISTS locality text`);
@@ -247,6 +268,42 @@ app.get('/', (_, res) => res.json({ service: 'CarCareBay API', ok: true }));
 
 /* ---------- AUTH ---------- */
 
+// OTP password reset uses MSG91. Configure MSG91_AUTH_KEY in Render and, for India,
+// complete MSG91's sender/template/DLT setup. The OTP itself is generated and verified
+// by MSG91; the app never stores plaintext OTPs.
+const resetRate = new Map();
+function normalizePhone(phone){
+  const raw=String(phone||'').replace(/[^0-9+]/g,'');
+  if(raw.startsWith('+')) return raw.slice(1);
+  if(raw.startsWith('91') && raw.length>=12) return raw;
+  return `91${raw}`;
+}
+function resetRateAllowed(phone){
+  const now=Date.now(); const key=normalizePhone(phone); const item=resetRate.get(key) || {count:0,at:now};
+  if(now-item.at>15*60*1000){item.count=0;item.at=now;}
+  if(item.count>=5) return false;
+  item.count++; resetRate.set(key,item); return true;
+}
+async function msg91SendOtp(phone){
+  if(!process.env.MSG91_AUTH_KEY) throw new Error('Password reset service is not configured yet.');
+  const mobile=normalizePhone(phone);
+  const params=new URLSearchParams({authkey:process.env.MSG91_AUTH_KEY,mobile,otp_length:'6',otp_expiry:'10'});
+  if(process.env.MSG91_SENDER_ID) params.set('sender',process.env.MSG91_SENDER_ID);
+  if(process.env.MSG91_OTP_MESSAGE) params.set('message',process.env.MSG91_OTP_MESSAGE);
+  const r=await fetch(`https://api.msg91.com/api/sendotp.php?${params.toString()}`);
+  const d=await r.json().catch(()=>({}));
+  if(!r.ok || d.type==='error') throw new Error('Unable to send OTP right now. Please try again.');
+  return d;
+}
+async function msg91VerifyOtp(phone,otp){
+  if(!process.env.MSG91_AUTH_KEY) throw new Error('Password reset service is not configured yet.');
+  const params=new URLSearchParams({authkey:process.env.MSG91_AUTH_KEY,mobile:normalizePhone(phone),otp:String(otp||'')});
+  const r=await fetch(`https://api.msg91.com/api/verifyRequestOTP.php?${params.toString()}`);
+  const d=await r.json().catch(()=>({}));
+  if(!r.ok || d.type==='error' || d.message!=='number_verified_successfully') throw new Error('Invalid or expired OTP.');
+  return d;
+}
+
 app.post('/api/auth/register', asyncRoute(async (req, res) => {
   const { name, full_name, phone, email, password, apartment_id } = req.body;
   if (!phone || !password || !(name || full_name)) {
@@ -277,6 +334,42 @@ app.post('/api/auth/register', asyncRoute(async (req, res) => {
   `, [phone, hash, customer.id]);
 
   res.status(201).json({ token: sign(customer), user: customer });
+}));
+
+app.post('/api/auth/password-reset/request', asyncRoute(async (req,res)=>{
+  const phone=String(req.body?.phone||'').trim();
+  if(!phone) return res.status(400).json({error:'Mobile number is required'});
+  const generic={message:'If an account exists for this mobile number, an OTP has been sent.'};
+  if(!resetRateAllowed(phone)) return res.json(generic);
+  await ensureAuthTable();
+  const existing=await q(`SELECT id FROM auth_credentials WHERE phone=$1 LIMIT 1`,[phone]);
+  if(!existing.rows.length) return res.json(generic);
+  await msg91SendOtp(phone);
+  res.json(generic);
+}));
+
+app.post('/api/auth/password-reset/verify', asyncRoute(async (req,res)=>{
+  const phone=String(req.body?.phone||'').trim(); const otp=String(req.body?.otp||'').trim();
+  if(!phone || !otp) return res.status(400).json({error:'Mobile number and OTP are required'});
+  await ensureAuthTable();
+  const existing=await q(`SELECT id,role FROM auth_credentials WHERE phone=$1 LIMIT 1`,[phone]);
+  if(!existing.rows.length) return res.status(400).json({error:'Invalid or expired OTP.'});
+  await msg91VerifyOtp(phone,otp);
+  const reset_token=jwt.sign({phone,purpose:'password_reset'},process.env.JWT_SECRET,{expiresIn:'10m'});
+  res.json({reset_token});
+}));
+
+app.post('/api/auth/password-reset/complete', asyncRoute(async (req,res)=>{
+  const {reset_token,password}=req.body||{};
+  if(!reset_token || !password) return res.status(400).json({error:'Reset token and new password are required'});
+  if(String(password).length<6) return res.status(400).json({error:'Password must be at least 6 characters'});
+  let payload;
+  try{payload=jwt.verify(reset_token,process.env.JWT_SECRET);}catch{return res.status(401).json({error:'Reset session expired. Please request a new OTP.'});}
+  if(payload.purpose!=='password_reset' || !payload.phone) return res.status(401).json({error:'Invalid reset session'});
+  const hash=await bcrypt.hash(String(password),12);
+  const r=await q(`UPDATE auth_credentials SET password_hash=$1 WHERE phone=$2 RETURNING id,role`,[hash,payload.phone]);
+  if(!r.rows.length) return res.status(400).json({error:'Account not found'});
+  res.json({message:'Password reset successfully'});
 }));
 
 app.post('/api/auth/login', asyncRoute(async (req, res) => {
@@ -405,7 +498,7 @@ app.get('/api/vehicles', auth, asyncRoute(async (req, res) => {
 }));
 
 app.post('/api/vehicles', auth, asyncRoute(async (req, res) => {
-  const { make, model, registration_number, color, vehicle_type, parking_bay_id, tower_block, wing, flat_number, floor_number } = req.body;
+  const { make, model, registration_number, color, vehicle_type, parking_bay_id, tower_block, wing, flat_number, floor_number, service_address, address_line2, city, pincode, landmark } = req.body;
   if (!registration_number) return res.status(400).json({ error: 'registration_number is required' });
 
   if (parking_bay_id) {
@@ -419,7 +512,7 @@ app.post('/api/vehicles', auth, asyncRoute(async (req, res) => {
   const existing = await q('SELECT * FROM vehicles WHERE customer_id=$1 AND registration_number=$2 AND deleted_at IS NULL LIMIT 1',[req.user.sub, registration_number]);
   if (existing.rows.length) return res.status(409).json({ error: 'Vehicle with this registration number already exists', vehicle: existing.rows[0] });
 
-  const r = await q(`INSERT INTO vehicles(customer_id,parking_bay_id,registration_number,make,model,color,vehicle_type,tower_block,wing,flat_number,floor_number) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`, [req.user.sub, parking_bay_id || null, registration_number, make || null, model || null, color || null, vehicle_type || 'car', tower_block || null, wing || null, flat_number || null, floor_number == null || floor_number === '' ? null : Number(floor_number)]);
+  const r = await q(`INSERT INTO vehicles(customer_id,parking_bay_id,registration_number,make,model,color,vehicle_type,tower_block,wing,flat_number,floor_number,service_address,address_line2,city,pincode,landmark) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *`, [req.user.sub, parking_bay_id || null, registration_number, make || null, model || null, color || null, vehicle_type || 'car', tower_block || null, wing || null, flat_number || null, floor_number == null || floor_number === '' ? null : Number(floor_number), service_address || null, address_line2 || null, city || null, pincode || null, landmark || null]);
   if(parking_bay_id) await q(`UPDATE parking_bays SET status='occupied' WHERE id=$1`,[parking_bay_id]);
   res.status(201).json(r.rows[0]);
 }));
@@ -427,7 +520,7 @@ app.post('/api/vehicles', auth, asyncRoute(async (req, res) => {
 app.patch('/api/vehicles/:id', auth, asyncRoute(async (req, res) => {
   const current=(await q('SELECT * FROM vehicles WHERE id=$1 AND customer_id=$2 AND deleted_at IS NULL',[req.params.id,req.user.sub])).rows[0];
   if(!current) return res.status(404).json({error:'Vehicle not found'});
-  const allowed = ['make','model','registration_number','color','vehicle_type','parking_bay_id','tower_block','wing','flat_number','floor_number'];
+  const allowed = ['make','model','registration_number','color','vehicle_type','parking_bay_id','tower_block','wing','flat_number','floor_number','service_address','address_line2','city','pincode','landmark'];
   const fields = allowed.filter(k => Object.prototype.hasOwnProperty.call(req.body, k));
   if (!fields.length) return res.status(400).json({ error: 'No fields to update' });
   if(req.body.registration_number){
@@ -766,7 +859,7 @@ app.get('/api/bookings', auth, asyncRoute(async(req,res)=>{
   if(req.user.role==='admin'){
     r=await q(`
       SELECT b.*, c.full_name AS customer_name,c.phone AS customer_phone,
-             v.registration_number,v.make,v.model,
+             v.registration_number,v.make,v.model,v.service_address,v.address_line2,v.city,v.pincode,v.landmark,
              a.name AS apartment_name,p.full_name AS partner_name,rt.rating,rt.comment AS rating_comment
       FROM bookings b
       JOIN customers c ON c.id=b.customer_id
@@ -779,7 +872,7 @@ app.get('/api/bookings', auth, asyncRoute(async(req,res)=>{
   } else if(req.user.role==='partner'){
     r=await q(`
       SELECT b.*, c.full_name AS customer_name,c.phone AS customer_phone,
-             v.registration_number,v.make,v.model,a.name AS apartment_name,rt.rating,rt.comment AS rating_comment
+             v.registration_number,v.make,v.model,v.service_address,v.address_line2,v.city,v.pincode,v.landmark,a.name AS apartment_name,rt.rating,rt.comment AS rating_comment
       FROM bookings b JOIN customers c ON c.id=b.customer_id
       JOIN vehicles v ON v.id=b.vehicle_id
       LEFT JOIN apartments a ON a.id=b.apartment_id
@@ -788,7 +881,7 @@ app.get('/api/bookings', auth, asyncRoute(async(req,res)=>{
     `,[req.user.sub]);
   } else {
     r=await q(`
-      SELECT b.*, v.registration_number,v.make,v.model,a.name AS apartment_name,
+      SELECT b.*, v.registration_number,v.make,v.model,v.service_address,v.address_line2,v.city,v.pincode,v.landmark,a.name AS apartment_name,
              p.full_name AS partner_name,rt.rating,rt.comment AS rating_comment
       FROM bookings b JOIN vehicles v ON v.id=b.vehicle_id
       LEFT JOIN apartments a ON a.id=b.apartment_id
@@ -870,6 +963,7 @@ app.post('/api/bookings', auth, asyncRoute(async(req,res)=>{
   if(!vehicle_id || !service_type || !scheduled_date || !scheduled_time)return res.status(400).json({error:'vehicle_id, service_type, scheduled_date and scheduled_time are required'});
   const vr=await q('SELECT * FROM vehicles WHERE id=$1 AND customer_id=$2',[vehicle_id,req.user.sub]);
   if(!vr.rows.length)return res.status(404).json({error:'Vehicle not found'});
+  if(!vr.rows[0].service_address)return res.status(409).json({error:'Please add a service address to this vehicle before booking.'});
 
   // Membership is account-level. One customer account has one shared wash allowance across all vehicles.
   const subR=await q(`SELECT s.*,p.name AS plan_name,p.wash_credits,COALESCE(s.carryover_exterior,0) AS carryover_exterior FROM subscriptions s JOIN service_plans p ON p.id=s.plan_id WHERE s.customer_id=$1 AND s.status='active' ORDER BY s.created_at DESC LIMIT 1`,[req.user.sub]);
@@ -1067,6 +1161,18 @@ app.patch('/api/partners/:id', auth, roles('admin'), asyncRoute(async(req,res)=>
   res.json(r.rows[0]);
 }));
 
+
+async function sendExpoPush(token,title,body,data={}){
+  if(!token || !String(token).startsWith('ExponentPushToken')) return;
+  try{ await fetch('https://exp.host/--/api/v2/push/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({to:token,sound:'default',title,body,data})}); }catch(e){ console.error('Expo push failed:',e.message); }
+}
+async function createPartnerNotification(partnerId,title,message,notification_type='general',data={}){
+  const r=await q(`INSERT INTO notifications(partner_id,title,message,notification_type) VALUES($1,$2,$3,$4) RETURNING *`,[partnerId,title,message,notification_type]);
+  const p=(await q('SELECT expo_push_token FROM partners WHERE id=$1',[partnerId])).rows[0];
+  if(p?.expo_push_token) await sendExpoPush(p.expo_push_token,title,message,{notification_id:r.rows[0].id,...data});
+  return r.rows[0];
+}
+
 app.post('/api/bookings/:id/assign-partner', auth, roles('admin'), asyncRoute(async(req,res)=>{
   const {partner_id}=req.body;
   if(!partner_id)return res.status(400).json({error:'partner_id is required'});
@@ -1079,6 +1185,8 @@ app.post('/api/bookings/:id/assign-partner', auth, roles('admin'), asyncRoute(as
   if(String(partner.rows[0].status||'').toLowerCase()!=='active')return res.status(409).json({error:'Only active employees can be assigned.'});
   const r=await q(`UPDATE bookings SET partner_id=$1,status='assigned' WHERE id=$2 AND status='scheduled' RETURNING *`,[partner_id,req.params.id]);
   if(!r.rows.length)return res.status(409).json({error:'Only scheduled bookings can be assigned to an employee.'});
+  const details=(await q(`SELECT b.scheduled_date,b.scheduled_time,v.make,v.model,v.registration_number,v.service_address,c.full_name AS customer_name FROM bookings b JOIN vehicles v ON v.id=b.vehicle_id JOIN customers c ON c.id=b.customer_id WHERE b.id=$1`,[req.params.id])).rows[0];
+  await createPartnerNotification(partner_id,'New job assigned',`${details?.customer_name||'Customer'} · ${details?.make||'Car'} ${details?.model||''} · ${details?.scheduled_time||'Scheduled job'}`,'job_assigned',{booking_id:req.params.id});
   res.json(r.rows[0]);
 }));
 
@@ -1099,6 +1207,14 @@ app.post('/api/ratings', auth, asyncRoute(async(req,res)=>{
     VALUES($1,$2,$3,$4,$5) RETURNING *`,
     [booking_id,req.user.sub,b.rows[0].partner_id || null,Number(rating),comment || null]);
   res.status(201).json(r.rows[0]);
+}));
+
+/* ---------- DEVICE NOTIFICATIONS ---------- */
+app.post('/api/push-token', auth, asyncRoute(async(req,res)=>{
+  const {token}=req.body||{}; if(!token)return res.status(400).json({error:'token is required'});
+  if(req.user.role==='partner') await q('UPDATE partners SET expo_push_token=$1 WHERE id=$2',[token,req.user.sub]);
+  else if(req.user.role==='customer') await q('UPDATE customers SET expo_push_token=$1 WHERE id=$2',[token,req.user.sub]);
+  res.json({ok:true});
 }));
 
 /* ---------- NOTIFICATIONS ---------- */
